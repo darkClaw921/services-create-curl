@@ -45,7 +45,7 @@ chmod +x service.sh
 Вы также можете запустить скрипт одной командой без необходимости сохранять его на диск:
 
 ```bash
-sudo bash <(curl -sSL https://raw.githubusercontent.com/user/repo/main/service.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/darkClaw921/services-create-curl/master/service.sh) <(echo)
 ```
 
 > ⚠️ **Внимание**: Эта команда загружает и выполняет скрипт напрямую. Всегда проверяйте скрипты из интернета перед их выполнением с правами суперпользователя!
@@ -130,9 +130,6 @@ sudo ./service.sh
 # Клонируем репозиторий
 git clone https://github.com/username/project.git
 cd project
-
-# Запускаем менеджер сервисов напрямую через curl
-sudo bash <(curl -sSL https://raw.githubusercontent.com/user/repo/main/service.sh)
 
 # Выбираем нужные опции и создаем сервис
 ```
