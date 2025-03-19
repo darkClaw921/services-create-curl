@@ -58,12 +58,13 @@ select_runtime() {
   echo -e "${YELLOW}Выберите параметр запуска:${NC}"
   echo -e "${CYAN}1.${NC} Чистый Python ${BOLD}(python3)${NC}"
   echo -e "${CYAN}2.${NC} UV менеджер ${BOLD}(uv run)${NC}"
+  echo -e "${CYAN}3.${NC} Poetry ${BOLD}(poetry run python)${NC}"
   echo ""
   echo -e "${YELLOW}---------------------------------------------${NC}"
-  echo -n -e "${GREEN}Выберите опцию (1-2): ${NC}"
+  echo -n -e "${GREEN}Выберите опцию (1-3): ${NC}"
   read runtime_choice
   
-  if ! [[ "$runtime_choice" =~ ^[1-2]$ ]]; then
+  if ! [[ "$runtime_choice" =~ ^[1-3]$ ]]; then
     echo -e "${RED}Некорректный выбор!${NC}"
     sleep 2
     return 1
@@ -80,7 +81,7 @@ select_runtime() {
       return 1
     fi
     
-  else
+  elif [ "$runtime_choice" -eq 2 ]; then
     runtime_type="uv"
     echo -e "${GREEN}Выбран запуск через UV менеджер${NC}"
     
@@ -89,6 +90,27 @@ select_runtime() {
       echo -e "${RED}UV менеджер не найден в системе. Установите UV для использования этого режима.${NC}"
       sleep 2
       return 1
+    fi
+  else
+    runtime_type="poetry"
+    echo -e "${GREEN}Выбран запуск через Poetry${NC}"
+    
+    # Проверяем наличие Poetry
+    if ! check_command "poetry"; then
+      echo -e "${RED}Poetry не найден в системе. Установите Poetry для использования этого режима.${NC}"
+      sleep 2
+      return 1
+    fi
+    
+    # Проверяем наличие pyproject.toml
+    if [ ! -f "pyproject.toml" ]; then
+      echo -e "${YELLOW}Предупреждение: файл pyproject.toml не найден в текущей директории.${NC}"
+      echo -e "${YELLOW}Poetry может работать некорректно без файла pyproject.toml.${NC}"
+      echo -n -e "${GREEN}Продолжить несмотря на это? (y/n): ${NC}"
+      read continue_anyway
+      if [[ "$continue_anyway" != "y" && "$continue_anyway" != "Y" ]]; then
+        return 1
+      fi
     fi
   fi
   
@@ -164,10 +186,14 @@ create_service() {
     # Получаем полный путь к python3
     python_path=$(which python3)
     exec_command="$python_path $file"
-  else
+  elif [ "$runtime" == "uv" ]; then
     # Получаем полный путь к uv
     uv_path=$(which uv)
     exec_command="$uv_path run $file"
+  elif [ "$runtime" == "poetry" ]; then
+    # Получаем полный путь к poetry
+    poetry_path=$(which poetry)
+    exec_command="$poetry_path run python $file"
   fi
   
   # Запрашиваем описание сервиса
