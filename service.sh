@@ -59,12 +59,13 @@ select_runtime() {
   echo -e "${CYAN}1.${NC} Чистый Python ${BOLD}(python3)${NC}"
   echo -e "${CYAN}2.${NC} UV менеджер ${BOLD}(uv run)${NC}"
   echo -e "${CYAN}3.${NC} Poetry ${BOLD}(poetry run python)${NC}"
+  echo -e "${CYAN}4.${NC} PHP сервер ${BOLD}(php -S host:port)${NC}"
   echo ""
   echo -e "${YELLOW}---------------------------------------------${NC}"
-  echo -n -e "${GREEN}Выберите опцию (1-3): ${NC}"
+  echo -n -e "${GREEN}Выберите опцию (1-4): ${NC}"
   read runtime_choice
   
-  if ! [[ "$runtime_choice" =~ ^[1-3]$ ]]; then
+  if ! [[ "$runtime_choice" =~ ^[1-4]$ ]]; then
     echo -e "${RED}Некорректный выбор!${NC}"
     sleep 2
     return 1
@@ -88,6 +89,27 @@ select_runtime() {
     # Проверяем наличие UV
     if ! check_command "uv"; then
       echo -e "${RED}UV менеджер не найден в системе. Установите UV для использования этого режима.${NC}"
+      sleep 2
+      return 1
+    fi
+  elif [ "$runtime_choice" -eq 4 ]; then
+    runtime_type="php"
+    echo -e "${GREEN}Выбран запуск через PHP сервер${NC}"
+    
+    # Проверяем наличие PHP
+    if ! check_command "php"; then
+      echo -e "${RED}PHP не найден в системе. Установите PHP для использования этого режима.${NC}"
+      sleep 2
+      return 1
+    fi
+    
+    # Запрашиваем порт для запуска PHP
+    echo -n -e "${GREEN}Введите хост и порт для запуска PHP (например, localhost:8000): ${NC}"
+    read php_host_port
+    
+    # Проверяем корректность ввода
+    if ! [[ "$php_host_port" =~ ^[^:]+:[0-9]+$ ]]; then
+      echo -e "${RED}Некорректный формат! Требуется формат хост:порт (например, localhost:8000)${NC}"
       sleep 2
       return 1
     fi
@@ -190,6 +212,10 @@ create_service() {
     # Получаем полный путь к uv
     uv_path=$(which uv)
     exec_command="$uv_path run $file"
+  elif [ "$runtime" == "php" ]; then
+    # Получаем полный путь к php
+    php_path=$(which php)
+    exec_command="$php_path -S $php_host_port $file"
   elif [ "$runtime" == "poetry" ]; then
     # Получаем полный путь к poetry
     poetry_path=$(which poetry)
