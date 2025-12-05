@@ -776,17 +776,17 @@ list_nginx_configs() {
 # Функция для отображения информации о конфигурации nginx
 show_nginx_config_info() {
   local config_file="$1"
-  local filename=$(basename "$config_file")
-  
-  # Извлекаем server_name
-  local server_names=$(grep -E "^\s*server_name" "$config_file" | sed 's/^\s*server_name\s*//' | sed 's/;//' | tr '\n' ' ')
-  
-  # Извлекаем порты из listen директив
-  local listen_ports=$(grep -E "^\s*listen" "$config_file" | grep -oE "[0-9]+" | sort -u | tr '\n' ' ')
-  
-  # Извлекаем proxy_pass если есть
-  local proxy_passes=$(grep -E "^\s*proxy_pass" "$config_file" | sed 's/^\s*proxy_pass\s*//' | sed 's/;//' | tr '\n' ' ')
-  
+      local filename=$(basename "$config_file")
+      
+      # Извлекаем server_name
+      local server_names=$(grep -E "^\s*server_name" "$config_file" | sed 's/^\s*server_name\s*//' | sed 's/;//' | tr '\n' ' ')
+      
+      # Извлекаем порты из listen директив
+      local listen_ports=$(grep -E "^\s*listen" "$config_file" | grep -oE "[0-9]+" | sort -u | tr '\n' ' ')
+      
+      # Извлекаем proxy_pass если есть
+      local proxy_passes=$(grep -E "^\s*proxy_pass" "$config_file" | sed 's/^\s*proxy_pass\s*//' | sed 's/;//' | tr '\n' ' ')
+      
   # Проверяем наличие SSL
   local has_ssl=false
   if grep -qE "^\s*listen\s+443" "$config_file" || grep -qE "ssl_certificate" "$config_file"; then
@@ -801,27 +801,27 @@ show_nginx_config_info() {
   fi
   
   echo -e "${CYAN}${BOLD}Файл:${NC} $filename"
-  if [ ! -z "$server_names" ]; then
-    echo -e "${YELLOW}  Домены:${NC} $server_names"
-  fi
-  if [ ! -z "$listen_ports" ]; then
-    echo -e "${GREEN}  Порты:${NC} $listen_ports"
-  else
-    echo -e "${RED}  Порты: не найдены${NC}"
-  fi
-  if [ ! -z "$proxy_passes" ]; then
-    echo -e "${BLUE}  Проксирование:${NC} $proxy_passes"
-  fi
+      if [ ! -z "$server_names" ]; then
+        echo -e "${YELLOW}  Домены:${NC} $server_names"
+      fi
+      if [ ! -z "$listen_ports" ]; then
+        echo -e "${GREEN}  Порты:${NC} $listen_ports"
+      else
+        echo -e "${RED}  Порты: не найдены${NC}"
+      fi
+      if [ ! -z "$proxy_passes" ]; then
+        echo -e "${BLUE}  Проксирование:${NC} $proxy_passes"
+      fi
   if [ "$has_ssl" = true ]; then
     echo -e "${GREEN}  SSL: настроен${NC}"
   else
     echo -e "${RED}  SSL: не настроен${NC}"
   fi
   if [ "$is_enabled" = true ]; then
-    echo -e "${GREEN}  Статус: АКТИВИРОВАН${NC}"
-  else
-    echo -e "${RED}  Статус: не активирован${NC}"
-  fi
+        echo -e "${GREEN}  Статус: АКТИВИРОВАН${NC}"
+      else
+        echo -e "${RED}  Статус: не активирован${NC}"
+      fi
 }
 
 # Функция для удаления конфигурации nginx
@@ -843,7 +843,7 @@ delete_nginx_config() {
   fi
   
   echo -e "${YELLOW}Информация о конфигурации:${NC}"
-  echo -e "${YELLOW}---------------------------------------------${NC}"
+      echo -e "${YELLOW}---------------------------------------------${NC}"
   show_nginx_config_info "$config_path"
   echo -e "${YELLOW}---------------------------------------------${NC}"
   echo ""
@@ -1115,41 +1115,28 @@ issue_ssl_certificate() {
     systemctl reload nginx
   fi
   
-  # Проверяем, есть ли уже зарегистрированный email в certbot
-  local certbot_email=""
-  if [ -f "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory" ]; then
-    # Пытаемся найти email в существующих аккаунтах
-    certbot_email=$(find /etc/letsencrypt/accounts -name "regr.json" -exec grep -o '"email":"[^"]*"' {} \; 2>/dev/null | head -1 | sed 's/"email":"\([^"]*\)"/\1/')
+  # Проверяем наличие зарегистрированного аккаунта certbot
+  local certbot_registered=false
+  if [ -d "/etc/letsencrypt/accounts" ] && [ -n "$(ls -A /etc/letsencrypt/accounts 2>/dev/null)" ]; then
+    certbot_registered=true
   fi
   
-  # Если email не найден, запрашиваем у пользователя
-  if [ -z "$certbot_email" ]; then
+  # Если аккаунт не зарегистрирован, запрашиваем email
+  local email_param=""
+  if [ "$certbot_registered" = false ]; then
     echo -e "${YELLOW}Для выпуска SSL сертификата требуется email адрес.${NC}"
     echo -e "${YELLOW}Он будет использован для уведомлений об истечении сертификата.${NC}"
     echo ""
     echo -n -e "${GREEN}Введите email адрес: ${NC}"
     read certbot_email
     
-    # Проверяем корректность email
     if [ -z "$certbot_email" ]; then
       echo -e "${RED}Email не может быть пустым!${NC}"
       sleep 2
       return 1
     fi
     
-    # Простая проверка формата email
-    if ! [[ "$certbot_email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-      echo -e "${YELLOW}Предупреждение: формат email может быть некорректным.${NC}"
-      echo -n -e "${GREEN}Продолжить с этим email? (y/n): ${NC}"
-      read confirm_email
-      if [[ "$confirm_email" != "y" && "$confirm_email" != "Y" ]]; then
-        echo -e "${YELLOW}Выпуск сертификата отменен.${NC}"
-        sleep 2
-        return 0
-      fi
-    fi
-  else
-    echo -e "${GREEN}Используется зарегистрированный email: ${certbot_email}${NC}"
+    email_param="--email $certbot_email"
   fi
   
   echo ""
@@ -1157,8 +1144,12 @@ issue_ssl_certificate() {
   echo -e "${YELLOW}---------------------------------------------${NC}"
   echo ""
   
-  # Запускаем certbot с email
-  certbot --nginx -d "$domain" --non-interactive --agree-tos --email "$certbot_email" --redirect
+  # Запускаем certbot с параметрами
+  if [ "$certbot_registered" = false ]; then
+    certbot --nginx -d "$domain" --non-interactive --agree-tos --redirect $email_param
+  else
+    certbot --nginx -d "$domain"
+  fi
   
   if [ $? -eq 0 ]; then
     echo ""
@@ -1203,7 +1194,7 @@ issue_ssl_certificate() {
     echo -e "${YELLOW}  4. Конфигурация nginx активирована${NC}"
   fi
   
-  sleep 3
+  sleep 5
   return 0
 }
 
@@ -1230,10 +1221,10 @@ manage_nginx_configs() {
     
     if [ ${#configs[@]} -eq 0 ]; then
       echo -e "${YELLOW}Конфигурационные файлы не найдены в $nginx_sites_dir${NC}"
-      echo ""
-      echo -e "${YELLOW}Нажмите Enter, чтобы вернуться в главное меню...${NC}"
-      read
-      return 0
+  echo ""
+  echo -e "${YELLOW}Нажмите Enter, чтобы вернуться в главное меню...${NC}"
+  read
+  return 0
     fi
     
     echo -e "${YELLOW}Список конфигураций nginx:${NC}"
@@ -1479,41 +1470,28 @@ EOF
       return 0
     fi
     
-    # Проверяем, есть ли уже зарегистрированный email в certbot
-    local certbot_email=""
-    if [ -f "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory" ]; then
-      # Пытаемся найти email в существующих аккаунтах
-      certbot_email=$(find /etc/letsencrypt/accounts -name "regr.json" -exec grep -o '"email":"[^"]*"' {} \; 2>/dev/null | head -1 | sed 's/"email":"\([^"]*\)"/\1/')
+    # Проверяем наличие зарегистрированного аккаунта certbot
+    local certbot_registered=false
+    if [ -d "/etc/letsencrypt/accounts" ] && [ -n "$(ls -A /etc/letsencrypt/accounts 2>/dev/null)" ]; then
+      certbot_registered=true
     fi
     
-    # Если email не найден, запрашиваем у пользователя
-    if [ -z "$certbot_email" ]; then
+    # Если аккаунт не зарегистрирован, запрашиваем email
+    local email_param=""
+    if [ "$certbot_registered" = false ]; then
       echo -e "${YELLOW}Для выпуска SSL сертификата требуется email адрес.${NC}"
       echo -e "${YELLOW}Он будет использован для уведомлений об истечении сертификата.${NC}"
       echo ""
       echo -n -e "${GREEN}Введите email адрес: ${NC}"
       read certbot_email
       
-      # Проверяем корректность email
       if [ -z "$certbot_email" ]; then
         echo -e "${RED}Email не может быть пустым!${NC}"
         sleep 2
         return 0
       fi
       
-      # Простая проверка формата email
-      if ! [[ "$certbot_email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-        echo -e "${YELLOW}Предупреждение: формат email может быть некорректным.${NC}"
-        echo -n -e "${GREEN}Продолжить с этим email? (y/n): ${NC}"
-        read confirm_email
-        if [[ "$confirm_email" != "y" && "$confirm_email" != "Y" ]]; then
-          echo -e "${YELLOW}Выпуск сертификата отменен.${NC}"
-          sleep 2
-          return 0
-        fi
-      fi
-    else
-      echo -e "${GREEN}Используется зарегистрированный email: ${certbot_email}${NC}"
+      email_param="--email $certbot_email"
     fi
     
     echo ""
@@ -1521,17 +1499,20 @@ EOF
     echo -e "${YELLOW}---------------------------------------------${NC}"
     echo ""
     
-    # Запускаем certbot с email
-    certbot --nginx -d "$domain" --non-interactive --agree-tos --email "$certbot_email" --redirect
+    # Запускаем certbot с параметрами
+    if [ "$certbot_registered" = false ]; then
+      certbot --nginx -d "$domain" --non-interactive --agree-tos --redirect $email_param
+    else
+      certbot --nginx -d "$domain"
+    fi
     
     if [ $? -eq 0 ]; then
       echo ""
       echo -e "${GREEN}${BOLD}SSL сертификат успешно выпущен и настроен!${NC}"
       
-      # Настраиваем автообновление через systemd timer (если еще не настроено)
+      # Настраиваем автообновление через systemd timer
       echo -e "${YELLOW}Проверка настроек автообновления certbot...${NC}"
       
-      # Проверяем наличие systemd таймера для certbot
       if systemctl list-timers | grep -q "certbot.timer"; then
         echo -e "${GREEN}Автообновление certbot уже настроено через systemd timer.${NC}"
       else
@@ -1540,7 +1521,7 @@ EOF
         systemctl start certbot.timer 2>/dev/null
         
         if [ $? -eq 0 ]; then
-          echo -e "${GREEN}Автообновление certbot настроено.${NC}"
+          echo -e "${GREEN}Автообновление certbot настроено через systemd timer.${NC}"
         else
           echo -e "${YELLOW}Не удалось настроить systemd timer.${NC}"
           echo -e "${YELLOW}Рекомендуется настроить cron для автообновления:${NC}"
@@ -1554,7 +1535,6 @@ EOF
       echo -e "${YELLOW}  1. Домен $domain указывает на IP этого сервера${NC}"
       echo -e "${YELLOW}  2. Порты 80 и 443 открыты в firewall${NC}"
       echo -e "${YELLOW}  3. Nginx работает корректно${NC}"
-      echo -e "${YELLOW}  4. Конфигурация nginx активирована${NC}"
     fi
   else
     echo -e "${YELLOW}Выпуск SSL сертификата пропущен.${NC}"
