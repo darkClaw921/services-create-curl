@@ -752,80 +752,547 @@ manage_services() {
   done
 }
 
-# Функция для проверки портов в конфигурациях nginx
-check_nginx_ports() {
+# Функция для получения списка конфигураций nginx
+list_nginx_configs() {
+  local nginx_sites_dir="/etc/nginx/sites-available"
+  local configs=()
+  
+  if [ ! -d "$nginx_sites_dir" ]; then
+    return 1
+  fi
+  
+  # Собираем список конфигураций
+  for config_file in "$nginx_sites_dir"/*; do
+    if [ -f "$config_file" ]; then
+      configs+=("$(basename "$config_file")")
+    fi
+  done
+  
+  # Выводим массив через echo для использования в других функциях
+  printf '%s\n' "${configs[@]}"
+  return 0
+}
+
+# Функция для отображения информации о конфигурации nginx
+show_nginx_config_info() {
+  local config_file="$1"
+  local filename=$(basename "$config_file")
+  
+  # Извлекаем server_name
+  local server_names=$(grep -E "^\s*server_name" "$config_file" | sed 's/^\s*server_name\s*//' | sed 's/;//' | tr '\n' ' ')
+  
+  # Извлекаем порты из listen директив
+  local listen_ports=$(grep -E "^\s*listen" "$config_file" | grep -oE "[0-9]+" | sort -u | tr '\n' ' ')
+  
+  # Извлекаем proxy_pass если есть
+  local proxy_passes=$(grep -E "^\s*proxy_pass" "$config_file" | sed 's/^\s*proxy_pass\s*//' | sed 's/;//' | tr '\n' ' ')
+  
+  # Проверяем наличие SSL
+  local has_ssl=false
+  if grep -qE "^\s*listen\s+443" "$config_file" || grep -qE "ssl_certificate" "$config_file"; then
+    has_ssl=true
+  fi
+  
+  # Проверяем активирован ли конфиг
+  local enabled_link="/etc/nginx/sites-enabled/${filename}"
+  local is_enabled=false
+  if [ -L "$enabled_link" ]; then
+    is_enabled=true
+  fi
+  
+  echo -e "${CYAN}${BOLD}Файл:${NC} $filename"
+  if [ ! -z "$server_names" ]; then
+    echo -e "${YELLOW}  Домены:${NC} $server_names"
+  fi
+  if [ ! -z "$listen_ports" ]; then
+    echo -e "${GREEN}  Порты:${NC} $listen_ports"
+  else
+    echo -e "${RED}  Порты: не найдены${NC}"
+  fi
+  if [ ! -z "$proxy_passes" ]; then
+    echo -e "${BLUE}  Проксирование:${NC} $proxy_passes"
+  fi
+  if [ "$has_ssl" = true ]; then
+    echo -e "${GREEN}  SSL: настроен${NC}"
+  else
+    echo -e "${RED}  SSL: не настроен${NC}"
+  fi
+  if [ "$is_enabled" = true ]; then
+    echo -e "${GREEN}  Статус: АКТИВИРОВАН${NC}"
+  else
+    echo -e "${RED}  Статус: не активирован${NC}"
+  fi
+}
+
+# Функция для удаления конфигурации nginx
+delete_nginx_config() {
+  local config_filename="$1"
+  local config_path="/etc/nginx/sites-available/${config_filename}"
+  local enabled_path="/etc/nginx/sites-enabled/${config_filename}"
+  
   clear_screen
   echo -e "${BOLD}${CYAN}==============================================${NC}"
-  echo -e "${BOLD}${CYAN}       ПРОВЕРКА ПОРТОВ NGINX                  ${NC}"
+  echo -e "${BOLD}${CYAN}      УДАЛЕНИЕ КОНФИГУРАЦИИ NGINX             ${NC}"
   echo -e "${BOLD}${CYAN}==============================================${NC}"
   echo ""
   
-  local nginx_sites_dir="/etc/nginx/sites-available"
+  if [ ! -f "$config_path" ]; then
+    echo -e "${RED}Конфигурация $config_filename не найдена!${NC}"
+    sleep 2
+    return 1
+  fi
   
-  if [ ! -d "$nginx_sites_dir" ]; then
-    echo -e "${RED}Директория $nginx_sites_dir не найдена.${NC}"
-    echo -e "${YELLOW}Убедитесь, что nginx установлен.${NC}"
+  echo -e "${YELLOW}Информация о конфигурации:${NC}"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  show_nginx_config_info "$config_path"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+  
+  echo -e "${RED}${BOLD}ВНИМАНИЕ: Это действие нельзя отменить!${NC}"
+  echo -n -e "${RED}Вы уверены, что хотите удалить конфигурацию $config_filename? (y/n): ${NC}"
+  read confirm
+  
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo -e "${YELLOW}Удаление отменено.${NC}"
+    sleep 2
+    return 0
+  fi
+  
+  # Отключаем конфигурацию если она активирована
+  if [ -L "$enabled_path" ]; then
+    echo -e "${YELLOW}Отключение конфигурации...${NC}"
+    rm -f "$enabled_path"
+  fi
+  
+  # Удаляем файл конфигурации
+  echo -e "${YELLOW}Удаление файла конфигурации...${NC}"
+  rm -f "$config_path"
+  
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}Конфигурация успешно удалена.${NC}"
+    
+    # Проверяем конфигурацию nginx
+    echo -e "${YELLOW}Проверка конфигурации nginx...${NC}"
+    nginx -t
+    
+    if [ $? -eq 0 ]; then
+      # Перезагружаем nginx
+      echo -e "${YELLOW}Перезагрузка nginx...${NC}"
+      systemctl reload nginx
+      echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
+    else
+      echo -e "${RED}Ошибка в конфигурации nginx!${NC}"
+    fi
+  else
+    echo -e "${RED}Ошибка при удалении конфигурации!${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  sleep 2
+  return 0
+}
+
+# Функция для редактирования конфигурации nginx
+edit_nginx_config() {
+  local config_filename="$1"
+  local config_path="/etc/nginx/sites-available/${config_filename}"
+  
+  clear_screen
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo -e "${BOLD}${CYAN}    РЕДАКТИРОВАНИЕ КОНФИГУРАЦИИ NGINX          ${NC}"
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+  
+  if [ ! -f "$config_path" ]; then
+    echo -e "${RED}Конфигурация $config_filename не найдена!${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  echo -e "${YELLOW}Информация о конфигурации:${NC}"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  show_nginx_config_info "$config_path"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+  
+  # Проверка наличия текстовых редакторов
+  local editor=""
+  if command -v vim &> /dev/null; then
+    editor="vim"
+  elif command -v vi &> /dev/null; then
+    editor="vi"
+  elif command -v nano &> /dev/null; then
+    editor="nano"
+  else
+    echo -e "${RED}Не найден текстовый редактор (vim, vi или nano).${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  echo -e "${YELLOW}Открываем файл конфигурации в редакторе $editor...${NC}"
+  sleep 1
+  
+  $editor "$config_path"
+  
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}Файл конфигурации отредактирован.${NC}"
+    
+    # Проверяем конфигурацию nginx
+    echo -e "${YELLOW}Проверка конфигурации nginx...${NC}"
+    nginx -t
+    
+    if [ $? -eq 0 ]; then
+      echo -e "${GREEN}Конфигурация корректна.${NC}"
+      
+      # Перезагружаем nginx
+      echo -e "${YELLOW}Перезагрузка nginx...${NC}"
+      systemctl reload nginx
+      
+      if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
+      else
+        echo -e "${RED}Ошибка при перезагрузке nginx!${NC}"
+      fi
+    else
+      echo -e "${RED}Ошибка в конфигурации nginx! Проверьте настройки.${NC}"
+      echo -e "${YELLOW}Изменения не применены.${NC}"
+    fi
+  else
+    echo -e "${RED}Редактирование файла было отменено.${NC}"
+  fi
+  
+  sleep 2
+  return 0
+}
+
+# Функция для включения/отключения конфигурации nginx
+toggle_nginx_config() {
+  local config_filename="$1"
+  local config_path="/etc/nginx/sites-available/${config_filename}"
+  local enabled_path="/etc/nginx/sites-enabled/${config_filename}"
+  
+  clear_screen
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo -e "${BOLD}${CYAN}   ВКЛЮЧЕНИЕ/ОТКЛЮЧЕНИЕ КОНФИГУРАЦИИ NGINX     ${NC}"
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+  
+  if [ ! -f "$config_path" ]; then
+    echo -e "${RED}Конфигурация $config_filename не найдена!${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  echo -e "${YELLOW}Информация о конфигурации:${NC}"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  show_nginx_config_info "$config_path"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+  
+  # Проверяем текущий статус
+  if [ -L "$enabled_path" ]; then
+    echo -e "${YELLOW}Конфигурация в данный момент активирована.${NC}"
+    echo -n -e "${GREEN}Отключить конфигурацию? (y/n): ${NC}"
+    read confirm
+    
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+      echo -e "${YELLOW}Отключение конфигурации...${NC}"
+      rm -f "$enabled_path"
+      
+      if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Конфигурация отключена.${NC}"
+        
+        # Проверяем конфигурацию nginx
+        echo -e "${YELLOW}Проверка конфигурации nginx...${NC}"
+        nginx -t
+        
+        if [ $? -eq 0 ]; then
+          # Перезагружаем nginx
+          echo -e "${YELLOW}Перезагрузка nginx...${NC}"
+          systemctl reload nginx
+          echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
+        fi
+      else
+        echo -e "${RED}Ошибка при отключении конфигурации!${NC}"
+      fi
+    else
+      echo -e "${YELLOW}Отключение отменено.${NC}"
+    fi
+  else
+    echo -e "${YELLOW}Конфигурация в данный момент не активирована.${NC}"
+    echo -n -e "${GREEN}Активировать конфигурацию? (y/n): ${NC}"
+    read confirm
+    
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+      echo -e "${YELLOW}Активация конфигурации...${NC}"
+      ln -s "$config_path" "$enabled_path"
+      
+      if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Конфигурация активирована.${NC}"
+        
+        # Проверяем конфигурацию nginx
+        echo -e "${YELLOW}Проверка конфигурации nginx...${NC}"
+        nginx -t
+        
+        if [ $? -eq 0 ]; then
+          # Перезагружаем nginx
+          echo -e "${YELLOW}Перезагрузка nginx...${NC}"
+          systemctl reload nginx
+          echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
+        else
+          echo -e "${RED}Ошибка в конфигурации nginx! Проверьте настройки.${NC}"
+          # Откатываем активацию
+          rm -f "$enabled_path"
+          echo -e "${YELLOW}Активация отменена из-за ошибки.${NC}"
+        fi
+      else
+        echo -e "${RED}Ошибка при активации конфигурации!${NC}"
+      fi
+    else
+      echo -e "${YELLOW}Активация отменена.${NC}"
+    fi
+  fi
+  
+  sleep 2
+  return 0
+}
+
+# Функция для выпуска SSL сертификата с автообновлением
+issue_ssl_certificate() {
+  local config_filename="$1"
+  local config_path="/etc/nginx/sites-available/${config_filename}"
+  
+  clear_screen
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo -e "${BOLD}${CYAN}   ВЫПУСК SSL СЕРТИФИКАТА С АВТООБНОВЛЕНИЕМ    ${NC}"
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+  
+  if [ ! -f "$config_path" ]; then
+    echo -e "${RED}Конфигурация $config_filename не найдена!${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  # Извлекаем домен из конфигурации
+  local domain=$(grep -E "^\s*server_name" "$config_path" | head -1 | sed 's/^\s*server_name\s*//' | sed 's/;//' | awk '{print $1}')
+  
+  if [ -z "$domain" ]; then
+    echo -e "${RED}Не удалось определить домен из конфигурации!${NC}"
+    echo -n -e "${GREEN}Введите домен вручную: ${NC}"
+    read domain
+  fi
+  
+  if [ -z "$domain" ]; then
+    echo -e "${RED}Домен не может быть пустым!${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  echo -e "${YELLOW}Информация о конфигурации:${NC}"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  show_nginx_config_info "$config_path"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+  echo -e "${YELLOW}Домен для сертификата: ${BOLD}$domain${NC}"
+  echo ""
+  
+  # Проверяем наличие certbot
+  if ! command -v certbot &> /dev/null; then
+    echo -e "${RED}Certbot не установлен в системе.${NC}"
+    echo -e "${YELLOW}Установите certbot для выпуска SSL сертификатов.${NC}"
+    echo -e "${YELLOW}Например: sudo apt install certbot python3-certbot-nginx${NC}"
     sleep 3
     return 1
   fi
   
-  echo -e "${YELLOW}Анализ конфигураций nginx...${NC}"
+  # Проверяем, активирована ли конфигурация
+  local enabled_path="/etc/nginx/sites-enabled/${config_filename}"
+  if [ ! -L "$enabled_path" ]; then
+    echo -e "${YELLOW}Конфигурация не активирована. Активируем...${NC}"
+    ln -s "$config_path" "$enabled_path"
+    systemctl reload nginx
+  fi
+  
+  echo -e "${YELLOW}Выпуск SSL сертификата для домена $domain...${NC}"
   echo -e "${YELLOW}---------------------------------------------${NC}"
   echo ""
   
-  local found_configs=false
+  # Запускаем certbot
+  certbot --nginx -d "$domain" --non-interactive --agree-tos --redirect
   
-  # Перебираем все файлы в sites-available
-  for config_file in "$nginx_sites_dir"/*; do
-    if [ -f "$config_file" ]; then
-      found_configs=true
-      local filename=$(basename "$config_file")
+  if [ $? -eq 0 ]; then
+    echo ""
+    echo -e "${GREEN}${BOLD}SSL сертификат успешно выпущен и настроен!${NC}"
+    
+    # Настраиваем автообновление через systemd timer (если еще не настроено)
+    echo -e "${YELLOW}Проверка настроек автообновления certbot...${NC}"
+    
+    # Проверяем наличие systemd таймера для certbot
+    if systemctl list-timers | grep -q "certbot.timer"; then
+      echo -e "${GREEN}Автообновление certbot уже настроено через systemd timer.${NC}"
+    else
+      echo -e "${YELLOW}Настройка автообновления certbot...${NC}"
+      systemctl enable certbot.timer 2>/dev/null
+      systemctl start certbot.timer 2>/dev/null
       
-      # Извлекаем server_name
-      local server_names=$(grep -E "^\s*server_name" "$config_file" | sed 's/^\s*server_name\s*//' | sed 's/;//' | tr '\n' ' ')
-      
-      # Извлекаем порты из listen директив
-      local listen_ports=$(grep -E "^\s*listen" "$config_file" | grep -oE "[0-9]+" | sort -u | tr '\n' ' ')
-      
-      # Извлекаем proxy_pass если есть
-      local proxy_passes=$(grep -E "^\s*proxy_pass" "$config_file" | sed 's/^\s*proxy_pass\s*//' | sed 's/;//' | tr '\n' ' ')
-      
-      echo -e "${CYAN}${BOLD}Файл:${NC} $filename"
-      
-      if [ ! -z "$server_names" ]; then
-        echo -e "${YELLOW}  Домены:${NC} $server_names"
-      fi
-      
-      if [ ! -z "$listen_ports" ]; then
-        echo -e "${GREEN}  Порты:${NC} $listen_ports"
+      if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Автообновление certbot настроено.${NC}"
       else
-        echo -e "${RED}  Порты: не найдены${NC}"
+        echo -e "${YELLOW}Не удалось настроить systemd timer.${NC}"
+        echo -e "${YELLOW}Рекомендуется настроить cron для автообновления:${NC}"
+        echo -e "${CYAN}0 0,12 * * * certbot renew --quiet${NC}"
       fi
-      
-      if [ ! -z "$proxy_passes" ]; then
-        echo -e "${BLUE}  Проксирование:${NC} $proxy_passes"
-      fi
-      
-      # Проверяем активирован ли конфиг
-      local enabled_link="/etc/nginx/sites-enabled/$(basename "$config_file")"
-      if [ -L "$enabled_link" ]; then
-        echo -e "${GREEN}  Статус: АКТИВИРОВАН${NC}"
-      else
-        echo -e "${RED}  Статус: не активирован${NC}"
-      fi
-      
-      echo -e "${YELLOW}---------------------------------------------${NC}"
     fi
-  done
-  
-  if [ "$found_configs" = false ]; then
-    echo -e "${YELLOW}Конфигурационные файлы не найдены в $nginx_sites_dir${NC}"
+    
+    # Проверяем конфигурацию nginx после изменений certbot
+    echo -e "${YELLOW}Проверка конфигурации nginx...${NC}"
+    nginx -t
+    
+    if [ $? -eq 0 ]; then
+      echo -e "${YELLOW}Перезагрузка nginx...${NC}"
+      systemctl reload nginx
+      echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
+    fi
+  else
+    echo ""
+    echo -e "${RED}Ошибка при выпуске SSL сертификата.${NC}"
+    echo -e "${YELLOW}Проверьте, что:${NC}"
+    echo -e "${YELLOW}  1. Домен $domain указывает на IP этого сервера${NC}"
+    echo -e "${YELLOW}  2. Порты 80 и 443 открыты в firewall${NC}"
+    echo -e "${YELLOW}  3. Nginx работает корректно${NC}"
+    echo -e "${YELLOW}  4. Конфигурация nginx активирована${NC}"
   fi
   
-  echo ""
-  echo -e "${YELLOW}Нажмите Enter, чтобы вернуться в главное меню...${NC}"
-  read
+  sleep 3
   return 0
+}
+
+# Функция для управления конфигурациями nginx
+manage_nginx_configs() {
+  while true; do
+    clear_screen
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo -e "${BOLD}${CYAN}      УПРАВЛЕНИЕ КОНФИГУРАЦИЯМИ NGINX        ${NC}"
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo ""
+    
+    local nginx_sites_dir="/etc/nginx/sites-available"
+    
+    if [ ! -d "$nginx_sites_dir" ]; then
+      echo -e "${RED}Директория $nginx_sites_dir не найдена.${NC}"
+      echo -e "${YELLOW}Убедитесь, что nginx установлен.${NC}"
+      sleep 3
+      return 1
+    fi
+    
+    # Получаем список конфигураций
+    local configs=($(list_nginx_configs))
+    
+    if [ ${#configs[@]} -eq 0 ]; then
+      echo -e "${YELLOW}Конфигурационные файлы не найдены в $nginx_sites_dir${NC}"
+      echo ""
+      echo -e "${YELLOW}Нажмите Enter, чтобы вернуться в главное меню...${NC}"
+      read
+      return 0
+    fi
+    
+    echo -e "${YELLOW}Список конфигураций nginx:${NC}"
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo ""
+    
+    # Выводим список конфигураций с информацией
+    for i in "${!configs[@]}"; do
+      local config_file="${nginx_sites_dir}/${configs[$i]}"
+      echo -e "${CYAN}$((i+1)).${NC}"
+      show_nginx_config_info "$config_file"
+      echo -e "${YELLOW}---------------------------------------------${NC}"
+    done
+    
+    echo ""
+    echo -e "${YELLOW}Выберите действие:${NC}"
+    echo -e "${CYAN}1.${NC} Выбрать конфигурацию для управления"
+    echo -e "${CYAN}2.${NC} Вернуться в главное меню"
+    echo ""
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo -n -e "${GREEN}Ваш выбор (1-2): ${NC}"
+    read action_choice
+    
+    if [ "$action_choice" -eq 1 ]; then
+      echo ""
+      echo -n -e "${GREEN}Введите номер конфигурации для управления: ${NC}"
+      read config_number
+      
+      if ! [[ "$config_number" =~ ^[0-9]+$ ]] || [ "$config_number" -lt 1 ] || [ "$config_number" -gt ${#configs[@]} ]; then
+        echo -e "${RED}Некорректный выбор!${NC}"
+        sleep 2
+        continue
+      fi
+      
+      local selected_config="${configs[$((config_number-1))]}"
+      
+      # Меню управления выбранной конфигурацией
+      while true; do
+        clear_screen
+        echo -e "${BOLD}${CYAN}==============================================${NC}"
+        echo -e "${BOLD}${CYAN}   УПРАВЛЕНИЕ: $selected_config                ${NC}"
+        echo -e "${BOLD}${CYAN}==============================================${NC}"
+        echo ""
+        
+        local config_file="${nginx_sites_dir}/${selected_config}"
+        show_nginx_config_info "$config_file"
+        echo ""
+        
+        echo -e "${YELLOW}Выберите действие:${NC}"
+        echo -e "${CYAN}1.${NC} Редактировать конфигурацию"
+        echo -e "${CYAN}2.${NC} Включить/отключить конфигурацию"
+        echo -e "${CYAN}3.${NC} Выпустить SSL сертификат с автообновлением"
+        echo -e "${CYAN}4.${NC} Удалить конфигурацию"
+        echo -e "${CYAN}5.${NC} Вернуться к списку конфигураций"
+        echo ""
+        echo -e "${YELLOW}---------------------------------------------${NC}"
+        echo -n -e "${GREEN}Ваш выбор (1-5): ${NC}"
+        read config_action
+        
+        case $config_action in
+          1)
+            edit_nginx_config "$selected_config"
+            ;;
+          2)
+            toggle_nginx_config "$selected_config"
+            ;;
+          3)
+            issue_ssl_certificate "$selected_config"
+            ;;
+          4)
+            delete_nginx_config "$selected_config"
+            # Если конфигурация удалена, выходим из меню управления
+            if [ ! -f "$config_file" ]; then
+              return 0
+            fi
+            ;;
+          5)
+            break
+            ;;
+          *)
+            echo -e "${RED}Некорректный выбор!${NC}"
+            sleep 1
+            ;;
+        esac
+      done
+    elif [ "$action_choice" -eq 2 ]; then
+      return 0
+    else
+      echo -e "${RED}Некорректный выбор!${NC}"
+      sleep 1
+    fi
+  done
+}
+
+# Функция для проверки портов в конфигурациях nginx (обновленная версия)
+check_nginx_ports() {
+  manage_nginx_configs
 }
 
 # Функция для создания конфигурации nginx
@@ -1152,7 +1619,7 @@ show_main_menu() {
     echo -e "${CYAN}1.${NC} Создать новый сервис"
     echo -e "${CYAN}2.${NC} Просмотреть и управлять существующими сервисами"
     echo -e "${CYAN}3.${NC} Менеджер уведомлений"
-    echo -e "${CYAN}4.${NC} Проверить порты nginx конфигураций"
+    echo -e "${CYAN}4.${NC} Управление конфигурациями nginx"
     echo -e "${CYAN}5.${NC} Создать конфигурацию nginx"
     echo -e "${CYAN}6.${NC} Завершить работу скрипта"
     echo ""
@@ -1175,7 +1642,7 @@ show_main_menu() {
         manage_notifications
         ;;
       4)
-        check_nginx_ports
+        manage_nginx_configs
         ;;
       5)
         create_nginx_config
