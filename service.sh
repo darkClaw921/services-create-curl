@@ -1115,12 +1115,50 @@ issue_ssl_certificate() {
     systemctl reload nginx
   fi
   
+  # Проверяем, есть ли уже зарегистрированный email в certbot
+  local certbot_email=""
+  if [ -f "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory" ]; then
+    # Пытаемся найти email в существующих аккаунтах
+    certbot_email=$(find /etc/letsencrypt/accounts -name "regr.json" -exec grep -o '"email":"[^"]*"' {} \; 2>/dev/null | head -1 | sed 's/"email":"\([^"]*\)"/\1/')
+  fi
+  
+  # Если email не найден, запрашиваем у пользователя
+  if [ -z "$certbot_email" ]; then
+    echo -e "${YELLOW}Для выпуска SSL сертификата требуется email адрес.${NC}"
+    echo -e "${YELLOW}Он будет использован для уведомлений об истечении сертификата.${NC}"
+    echo ""
+    echo -n -e "${GREEN}Введите email адрес: ${NC}"
+    read certbot_email
+    
+    # Проверяем корректность email
+    if [ -z "$certbot_email" ]; then
+      echo -e "${RED}Email не может быть пустым!${NC}"
+      sleep 2
+      return 1
+    fi
+    
+    # Простая проверка формата email
+    if ! [[ "$certbot_email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+      echo -e "${YELLOW}Предупреждение: формат email может быть некорректным.${NC}"
+      echo -n -e "${GREEN}Продолжить с этим email? (y/n): ${NC}"
+      read confirm_email
+      if [[ "$confirm_email" != "y" && "$confirm_email" != "Y" ]]; then
+        echo -e "${YELLOW}Выпуск сертификата отменен.${NC}"
+        sleep 2
+        return 0
+      fi
+    fi
+  else
+    echo -e "${GREEN}Используется зарегистрированный email: ${certbot_email}${NC}"
+  fi
+  
+  echo ""
   echo -e "${YELLOW}Выпуск SSL сертификата для домена $domain...${NC}"
   echo -e "${YELLOW}---------------------------------------------${NC}"
   echo ""
   
-  # Запускаем certbot
-  certbot --nginx -d "$domain" --non-interactive --agree-tos --redirect
+  # Запускаем certbot с email
+  certbot --nginx -d "$domain" --non-interactive --agree-tos --email "$certbot_email" --redirect
   
   if [ $? -eq 0 ]; then
     echo ""
@@ -1441,17 +1479,74 @@ EOF
       return 0
     fi
     
+    # Проверяем, есть ли уже зарегистрированный email в certbot
+    local certbot_email=""
+    if [ -f "/etc/letsencrypt/accounts/acme-v02.api.letsencrypt.org/directory" ]; then
+      # Пытаемся найти email в существующих аккаунтах
+      certbot_email=$(find /etc/letsencrypt/accounts -name "regr.json" -exec grep -o '"email":"[^"]*"' {} \; 2>/dev/null | head -1 | sed 's/"email":"\([^"]*\)"/\1/')
+    fi
+    
+    # Если email не найден, запрашиваем у пользователя
+    if [ -z "$certbot_email" ]; then
+      echo -e "${YELLOW}Для выпуска SSL сертификата требуется email адрес.${NC}"
+      echo -e "${YELLOW}Он будет использован для уведомлений об истечении сертификата.${NC}"
+      echo ""
+      echo -n -e "${GREEN}Введите email адрес: ${NC}"
+      read certbot_email
+      
+      # Проверяем корректность email
+      if [ -z "$certbot_email" ]; then
+        echo -e "${RED}Email не может быть пустым!${NC}"
+        sleep 2
+        return 0
+      fi
+      
+      # Простая проверка формата email
+      if ! [[ "$certbot_email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+        echo -e "${YELLOW}Предупреждение: формат email может быть некорректным.${NC}"
+        echo -n -e "${GREEN}Продолжить с этим email? (y/n): ${NC}"
+        read confirm_email
+        if [[ "$confirm_email" != "y" && "$confirm_email" != "Y" ]]; then
+          echo -e "${YELLOW}Выпуск сертификата отменен.${NC}"
+          sleep 2
+          return 0
+        fi
+      fi
+    else
+      echo -e "${GREEN}Используется зарегистрированный email: ${certbot_email}${NC}"
+    fi
+    
     echo ""
     echo -e "${YELLOW}Выпуск SSL сертификата для домена $domain...${NC}"
     echo -e "${YELLOW}---------------------------------------------${NC}"
     echo ""
     
-    # Запускаем certbot
-    certbot --nginx -d "$domain"
+    # Запускаем certbot с email
+    certbot --nginx -d "$domain" --non-interactive --agree-tos --email "$certbot_email" --redirect
     
     if [ $? -eq 0 ]; then
       echo ""
       echo -e "${GREEN}${BOLD}SSL сертификат успешно выпущен и настроен!${NC}"
+      
+      # Настраиваем автообновление через systemd timer (если еще не настроено)
+      echo -e "${YELLOW}Проверка настроек автообновления certbot...${NC}"
+      
+      # Проверяем наличие systemd таймера для certbot
+      if systemctl list-timers | grep -q "certbot.timer"; then
+        echo -e "${GREEN}Автообновление certbot уже настроено через systemd timer.${NC}"
+      else
+        echo -e "${YELLOW}Настройка автообновления certbot...${NC}"
+        systemctl enable certbot.timer 2>/dev/null
+        systemctl start certbot.timer 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+          echo -e "${GREEN}Автообновление certbot настроено.${NC}"
+        else
+          echo -e "${YELLOW}Не удалось настроить systemd timer.${NC}"
+          echo -e "${YELLOW}Рекомендуется настроить cron для автообновления:${NC}"
+          echo -e "${CYAN}0 0,12 * * * certbot renew --quiet${NC}"
+        fi
+      fi
     else
       echo ""
       echo -e "${RED}Ошибка при выпуске SSL сертификата.${NC}"
@@ -1459,6 +1554,7 @@ EOF
       echo -e "${YELLOW}  1. Домен $domain указывает на IP этого сервера${NC}"
       echo -e "${YELLOW}  2. Порты 80 и 443 открыты в firewall${NC}"
       echo -e "${YELLOW}  3. Nginx работает корректно${NC}"
+      echo -e "${YELLOW}  4. Конфигурация nginx активирована${NC}"
     fi
   else
     echo -e "${YELLOW}Выпуск SSL сертификата пропущен.${NC}"
