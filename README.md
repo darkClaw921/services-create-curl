@@ -34,6 +34,7 @@ curl -o service.sh https://raw.githubusercontent.com/darkClaw921/services-create
 chmod +x service.sh
 ```
 
+
 Или клонировать весь репозиторий:
 
 ```bash
@@ -50,6 +51,10 @@ chmod +x service.sh
 bash <(curl -sSL https://raw.githubusercontent.com/darkClaw921/services-create-curl/master/service.sh) <(echo)
 ```
 
+Чтобы установить почтовый сервер на голый vps можете испоьльзовать этот скрипт
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/darkClaw921/services-create-curl/master/setup_mail.sh) <(echo)
+``
 > ⚠️ **Внимание**: Эта команда загружает и выполняет скрипт напрямую. Всегда проверяйте скрипты из интернета перед их выполнением с правами суперпользователя!
 
 ## Использование
