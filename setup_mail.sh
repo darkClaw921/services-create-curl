@@ -1172,6 +1172,475 @@ show_domain_details() {
   esac
 }
 
+# Исправление проблемы SMTPUTF8
+fix_smtputf8_issue() {
+  clear_screen
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo -e "${BOLD}${CYAN}     ИСПРАВЛЕНИЕ ПРОБЛЕМЫ SMTPUTF8            ${NC}"
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+  echo -e "${YELLOW}Проблема:${NC} Postfix пытается использовать SMTPUTF8, но некоторые серверы"
+  echo -e "${YELLOW}          (например, Yandex) не поддерживают эту функцию.${NC}"
+  echo ""
+  
+  # Проверяем текущие настройки
+  echo -e "${YELLOW}Проверка текущих настроек Postfix...${NC}"
+  echo ""
+  local current_smtputf8=$(postconf smtputf8_enable 2>/dev/null | awk -F' = ' '{print $2}')
+  if [ -n "$current_smtputf8" ]; then
+    echo -e "${CYAN}Текущее значение smtputf8_enable:${NC} ${current_smtputf8}"
+  else
+    echo -e "${YELLOW}Параметр smtputf8_enable не установлен (используется значение по умолчанию)${NC}"
+  fi
+  echo ""
+  
+  echo -e "${YELLOW}Решение:${NC} Отключить требование SMTPUTF8 в Postfix и Dovecot."
+  echo ""
+  echo -e "${YELLOW}Это действие:${NC}"
+  echo -e "${CYAN}•${NC} Отключит требование SMTPUTF8 для исходящей почты (Postfix)"
+  echo -e "${CYAN}•${NC} Отключит SMTPUTF8 для submission порта"
+  echo -e "${CYAN}•${NC} Настроит Dovecot для работы без SMTPUTF8"
+  echo -e "${CYAN}•${NC} Перезапустит Postfix и Dovecot для применения изменений"
+  echo ""
+  echo -n -e "${GREEN}Продолжить исправление? (y/n): ${NC}"
+  read confirm
+  
+  if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo -e "${YELLOW}Исправление отменено.${NC}"
+    sleep 1
+    return 0
+  fi
+  
+  echo ""
+  echo -e "${YELLOW}Применение исправления...${NC}"
+  echo ""
+  
+  # Отключаем требование SMTPUTF8 в Postfix
+  # Ищем все файлы конфигурации, где может быть задано это значение
+  echo -e "${YELLOW}Поиск файлов конфигурации с smtputf8_enable...${NC}"
+  
+  # Ищем в основных файлах конфигурации
+  local config_files=(
+    "/etc/postfix/main.cf"
+    "/usr/share/postfix/main.cf.dist"
+    "/etc/postfix/main.cf.dist"
+  )
+  
+  # Ищем все файлы, которые могут содержать это значение
+  for config_file in "${config_files[@]}"; do
+    if [ -f "$config_file" ]; then
+      if grep -q "smtputf8_enable" "$config_file" 2>/dev/null; then
+        echo -e "${CYAN}Найдено в: ${config_file}${NC}"
+        # Удаляем или комментируем строку
+        sed -i 's/^smtputf8_enable/#smtputf8_enable/' "$config_file" 2>/dev/null || true
+      fi
+    fi
+  done
+  
+  # Ищем в директориях с конфигурацией
+  if [ -d "/etc/postfix" ]; then
+    find /etc/postfix -type f -name "*.cf" 2>/dev/null | while read -r file; do
+      if grep -q "smtputf8_enable" "$file" 2>/dev/null; then
+        echo -e "${CYAN}Найдено в: ${file}${NC}"
+        sed -i 's/^smtputf8_enable/#smtputf8_enable/' "$file" 2>/dev/null || true
+      fi
+    done
+  fi
+  
+  # Теперь добавляем явное значение в конец main.cf (после всех include)
+  if [ -f "/etc/postfix/main.cf" ]; then
+    # Удаляем все строки с smtputf8_enable (включая закомментированные, если они есть)
+    sed -i '/^[[:space:]]*smtputf8_enable/d' /etc/postfix/main.cf 2>/dev/null
+    sed -i '/^[[:space:]]*#.*smtputf8_enable/d' /etc/postfix/main.cf 2>/dev/null
+    
+    # Добавляем в самый конец файла (после всех include)
+    echo "" >> /etc/postfix/main.cf
+    echo "# Force disable SMTPUTF8 for compatibility" >> /etc/postfix/main.cf
+    echo "smtputf8_enable = no" >> /etc/postfix/main.cf
+    echo -e "${GREEN}✓${NC} Добавлено явное значение в конец main.cf"
+  fi
+  
+  # Устанавливаем compatibility_level = 0, чтобы smtputf8_enable стал no
+  # Логика: ${{$compatibility_level} <level {1} ? {no} : {yes}}
+  # Если compatibility_level < 1, то smtputf8_enable = no
+  if [ -f "/etc/postfix/main.cf" ]; then
+    # Удаляем старые значения compatibility_level
+    sed -i '/^compatibility_level/d' /etc/postfix/main.cf 2>/dev/null
+    # Добавляем compatibility_level = 0
+    echo "compatibility_level = 0" >> /etc/postfix/main.cf
+    echo -e "${GREEN}✓${NC} Установлен compatibility_level = 0 (это отключит SMTPUTF8)"
+  fi
+  
+  # Применяем через postconf
+  postconf -e "smtputf8_enable=no" 2>/dev/null
+  postconf -e "compatibility_level=0" 2>/dev/null
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✓${NC} Применено через postconf"
+  else
+    echo -e "${YELLOW}⚠${NC} postconf не применил значение (продолжаем)"
+  fi
+  
+  # Отключаем для submission порта
+  postconf -P submission/inet/smtputf8_enable=no 2>/dev/null
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✓${NC} Отключено SMTPUTF8 для submission порта"
+  else
+    echo -e "${YELLOW}⚠${NC} Не удалось отключить SMTPUTF8 для submission (может быть не критично)"
+  fi
+  
+  # Также отключаем для всех других сервисов
+  postconf -M smtp/inet/smtputf8_enable=no 2>/dev/null || true
+  
+  # Настраиваем Dovecot для работы без SMTPUTF8
+  # Проверяем наличие конфигурации Dovecot
+  if [ -f "/etc/dovecot/conf.d/10-master.conf" ]; then
+    # Проверяем, есть ли уже настройка для LMTP
+    if ! grep -q "lmtp_utf8" /etc/dovecot/conf.d/10-master.conf 2>/dev/null; then
+      # Добавляем настройку для отключения SMTPUTF8 в LMTP
+      sed -i '/service lmtp {/,/}/ {
+        /}/ i\
+  lmtp_utf8 = no
+      }' /etc/dovecot/conf.d/10-master.conf 2>/dev/null || true
+      echo -e "${GREEN}✓${NC} Настроен Dovecot для работы без SMTPUTF8"
+    fi
+  fi
+  
+  # Также проверяем master.cf для submission порта
+  if [ -f "/etc/postfix/master.cf" ]; then
+    # Убеждаемся, что submission порт настроен правильно
+    postconf -P "submission/inet/smtputf8_enable=no" 2>/dev/null || true
+  fi
+  
+  # Проверяем настройки перед перезапуском
+  echo ""
+  echo -e "${YELLOW}Проверка конфигурации Postfix...${NC}"
+  postfix check 2>/dev/null
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✓${NC} Конфигурация Postfix корректна"
+  else
+    echo -e "${YELLOW}⚠${NC} Обнаружены предупреждения в конфигурации Postfix"
+  fi
+  
+  # Перезапускаем Postfix
+  echo ""
+  echo -e "${YELLOW}Перезапуск Postfix...${NC}"
+  systemctl restart postfix 2>/dev/null
+  
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✓${NC} Postfix успешно перезапущен"
+  else
+    echo -e "${RED}✗${NC} Ошибка при перезапуске Postfix"
+    echo ""
+    echo -e "${YELLOW}Попробуйте перезапустить вручную: systemctl restart postfix${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  # Перезапускаем Dovecot
+  echo ""
+  echo -e "${YELLOW}Перезапуск Dovecot...${NC}"
+  
+  # Проверяем статус Dovecot перед перезапуском
+  if systemctl is-active --quiet dovecot 2>/dev/null; then
+    systemctl restart dovecot 2>/dev/null
+  else
+    echo -e "${YELLOW}Dovecot не запущен, пытаемся запустить...${NC}"
+    systemctl start dovecot 2>/dev/null
+  fi
+  
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}✓${NC} Dovecot успешно перезапущен/запущен"
+    
+    # Проверяем, что LMTP сокет создан
+    sleep 1
+    if [ -S "/var/spool/postfix/private/dovecot-lmtp" ]; then
+      echo -e "${GREEN}✓${NC} LMTP сокет создан"
+    else
+      echo -e "${YELLOW}⚠${NC} LMTP сокет не найден, проверьте конфигурацию Dovecot"
+      echo -e "${CYAN}Проверьте:${NC} systemctl status dovecot"
+      echo -e "${CYAN}Логи:${NC} journalctl -u dovecot -n 50"
+    fi
+  else
+    echo -e "${RED}✗${NC} Ошибка при перезапуске/запуске Dovecot"
+    echo -e "${YELLOW}Проверьте статус:${NC} systemctl status dovecot"
+    echo -e "${YELLOW}Проверьте логи:${NC} journalctl -u dovecot -n 50"
+    echo -e "${YELLOW}Попробуйте запустить вручную:${NC} systemctl start dovecot"
+  fi
+  
+  # Проверяем финальные настройки
+  echo ""
+  echo -e "${YELLOW}Проверка примененных настроек...${NC}"
+  local final_smtputf8=$(postconf smtputf8_enable 2>/dev/null | awk -F' = ' '{print $2}')
+  local final_compat=$(postconf compatibility_level 2>/dev/null | awk -F' = ' '{print $2}')
+  
+  echo -e "${CYAN}compatibility_level:${NC} ${final_compat:-не установлен}"
+  echo -e "${CYAN}smtputf8_enable:${NC} ${final_smtputf8}"
+  echo ""
+  
+  # Проверяем, что значение действительно "no" (не переменная)
+  if echo "$final_smtputf8" | grep -qE "^(no|NO)$"; then
+    echo -e "${GREEN}✓${NC} smtputf8_enable = no (применено успешно)"
+  elif echo "$final_smtputf8" | grep -qE "\$\{"; then
+    # Если все еще переменная, проверяем compatibility_level
+    if [ "$final_compat" = "0" ] || [ "$final_compat" = "0.0" ]; then
+      echo -e "${GREEN}✓${NC} compatibility_level = 0 установлен (это даст smtputf8_enable = no)"
+      echo -e "${YELLOW}Примечание:${NC} Значение вычисляется динамически, но должно быть 'no'"
+    else
+      echo -e "${RED}✗${NC} Настройка все еще использует переменную совместимости: ${final_smtputf8}"
+      echo -e "${YELLOW}compatibility_level:${NC} ${final_compat}"
+      echo -e "${YELLOW}Попытка принудительного исправления...${NC}"
+      # Пытаемся еще раз принудительно установить
+      if [ -f "/etc/postfix/main.cf" ]; then
+        sed -i '/^smtputf8_enable/d' /etc/postfix/main.cf 2>/dev/null
+        sed -i '/^compatibility_level/d' /etc/postfix/main.cf 2>/dev/null
+        echo "" >> /etc/postfix/main.cf
+        echo "# Force disable SMTPUTF8" >> /etc/postfix/main.cf
+        echo "compatibility_level = 0" >> /etc/postfix/main.cf
+        echo "smtputf8_enable = no" >> /etc/postfix/main.cf
+      fi
+      systemctl reload postfix 2>/dev/null || systemctl restart postfix 2>/dev/null
+      sleep 2
+      final_smtputf8=$(postconf smtputf8_enable 2>/dev/null | awk -F' = ' '{print $2}')
+      final_compat=$(postconf compatibility_level 2>/dev/null | awk -F' = ' '{print $2}')
+      if echo "$final_smtputf8" | grep -qE "^(no|NO)$" || [ "$final_compat" = "0" ]; then
+        echo -e "${GREEN}✓${NC} Настройка применена после принудительного исправления"
+      else
+        echo -e "${RED}✗${NC} Не удалось применить настройку."
+        echo -e "${YELLOW}Текущие значения:${NC}"
+        echo -e "${CYAN}compatibility_level:${NC} ${final_compat}"
+        echo -e "${CYAN}smtputf8_enable:${NC} ${final_smtputf8}"
+        echo ""
+        echo -e "${YELLOW}Попробуйте вручную добавить в /etc/postfix/main.cf:${NC}"
+        echo -e "${CYAN}compatibility_level = 0${NC}"
+        echo -e "${CYAN}smtputf8_enable = no${NC}"
+      fi
+    fi
+  else
+    echo -e "${YELLOW}⚠${NC} Неожиданное значение: ${final_smtputf8}"
+    echo -e "${YELLOW}Проверьте файл /etc/postfix/main.cf вручную${NC}"
+  fi
+  
+  echo ""
+  echo -e "${GREEN}${BOLD}Исправление завершено!${NC}"
+  echo ""
+  echo -e "${YELLOW}Теперь можно попробовать отправить письмо снова.${NC}"
+  echo -e "${YELLOW}Если проблема сохранится, проверьте логи:${NC}"
+  echo -e "${CYAN}•${NC} tail -f /var/log/syslog | grep -i postfix"
+  echo ""
+  echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"
+  read
+}
+
+# Просмотр логов отправленного сообщения
+view_email_logs() {
+  local sender_email="$1"
+  local recipient_email="$2"
+  
+  clear_screen
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo -e "${BOLD}${CYAN}     ЛОГИ ОТПРАВЛЕННОГО СООБЩЕНИЯ            ${NC}"
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+  echo -e "${YELLOW}От:${NC} ${CYAN}${sender_email}${NC}"
+  echo -e "${YELLOW}Кому:${NC} ${CYAN}${recipient_email}${NC}"
+  echo ""
+  echo -e "${YELLOW}Поиск логов Postfix...${NC}"
+  echo ""
+  
+  # Находим файл логов
+  local log_file=""
+  local mail_log_files=("/var/log/mail.log" "/var/log/maillog" "/var/log/postfix.log" "/var/log/syslog")
+  
+  for file in "${mail_log_files[@]}"; do
+    if [ -f "$file" ] && [ -r "$file" ]; then
+      log_file="$file"
+      break
+    fi
+  done
+  
+  if [ -z "$log_file" ]; then
+    echo -e "${RED}Не удалось найти файл логов Postfix.${NC}"
+    echo ""
+    echo -e "${YELLOW}Попытка просмотра через journalctl...${NC}"
+    echo ""
+    journalctl --since "5 minutes ago" --no-pager 2>/dev/null | grep -iE "postfix.*(${sender_email}|${recipient_email})" | head -50 || echo -e "${RED}Логи не найдены.${NC}"
+    echo ""
+    echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+    read
+    return
+  fi
+  
+  echo -e "${GREEN}Найден файл логов: ${log_file}${NC}"
+  echo ""
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+  
+  # Ищем ID сообщения по адресам отправителя и получателя
+  # Postfix использует формат: message-id: from=<email>, to=<email>
+  local message_ids=$(grep -iE "postfix.*from=<${sender_email//./\\.}>.*to=<${recipient_email//./\\.}>" "$log_file" 2>/dev/null | grep -oE "[A-F0-9]{10,12}:" | cut -d: -f1 | sort -u | head -5)
+  
+  # Если не нашли по обоим адресам, ищем только по отправителю
+  if [ -z "$message_ids" ]; then
+    message_ids=$(grep -iE "postfix.*from=<${sender_email//./\\.}>" "$log_file" 2>/dev/null | tail -20 | grep -oE "[A-F0-9]{10,12}:" | cut -d: -f1 | sort -u | head -5)
+  fi
+  
+  # Если все еще не нашли, ищем по получателю
+  if [ -z "$message_ids" ]; then
+    message_ids=$(grep -iE "postfix.*to=<${recipient_email//./\\.}>" "$log_file" 2>/dev/null | tail -20 | grep -oE "[A-F0-9]{10,12}:" | cut -d: -f1 | sort -u | head -5)
+  fi
+  
+  # Проверяем наличие ошибки SMTPUTF8 в логах, связанных с этим письмом
+  local has_smtputf8_error=false
+  
+  # Ищем ошибку SMTPUTF8 в логах, связанных с отправителем или получателем (за последние 10 минут)
+  local recent_logs=$(grep -iE "postfix.*(${sender_email//./\\.}|${recipient_email//./\\.})" "$log_file" 2>/dev/null | tail -100)
+  if echo "$recent_logs" | grep -qiE "SMTPUTF8.*required"; then
+    has_smtputf8_error=true
+  fi
+  
+  # Также проверяем последние логи на наличие ошибки SMTPUTF8 (даже без привязки к адресам)
+  if tail -100 "$log_file" 2>/dev/null | grep -qiE "SMTPUTF8.*required"; then
+    has_smtputf8_error=true
+  fi
+  
+  if [ -n "$message_ids" ]; then
+    echo -e "${CYAN}Найдены логи для сообщения(ий) с ID: $(echo $message_ids | tr '\n' ' ')${NC}"
+    echo ""
+    echo -e "${YELLOW}Полный путь обработки сообщения:${NC}"
+    echo ""
+    
+    # Показываем все логи для найденных ID сообщений
+    for msg_id in $message_ids; do
+      echo -e "${BOLD}${GREEN}--- Сообщение ID: ${msg_id} ---${NC}"
+      local msg_logs=$(grep -iE "postfix.*${msg_id}" "$log_file" 2>/dev/null | tail -30)
+      # Проверяем наличие ошибки SMTPUTF8 в логах этого сообщения
+      if echo "$msg_logs" | grep -qiE "SMTPUTF8.*required"; then
+        has_smtputf8_error=true
+      fi
+      # Выводим логи с цветовой подсветкой
+      echo "$msg_logs" | while IFS= read -r line; do
+        # Выделяем важные части логов цветом
+        if echo "$line" | grep -qiE "(bounced|reject|error|fail|defer|SMTPUTF8)"; then
+          echo -e "${RED}${line}${NC}"
+        elif echo "$line" | grep -qiE "(sent|delivered|success|relay)"; then
+          echo -e "${GREEN}${line}${NC}"
+        elif echo "$line" | grep -qiE "(from=|to=)"; then
+          echo -e "${CYAN}${line}${NC}"
+        else
+          echo "$line"
+        fi
+      done
+      echo ""
+    done
+  else
+    # Если не нашли по ID, показываем логи по адресам
+    echo -e "${CYAN}Логи, связанные с отправкой письма (последние 50 строк):${NC}"
+    echo ""
+    local email_logs=$(grep -iE "postfix.*(${sender_email//./\\.}|${recipient_email//./\\.})" "$log_file" 2>/dev/null | tail -50)
+    
+    # Проверяем наличие ошибки SMTPUTF8 в этих логах
+    if echo "$email_logs" | grep -qiE "SMTPUTF8.*required"; then
+      has_smtputf8_error=true
+    fi
+    
+    # Выводим логи с цветовой подсветкой
+    echo "$email_logs" | while IFS= read -r line; do
+      if echo "$line" | grep -qiE "(bounced|reject|error|fail|defer|SMTPUTF8)"; then
+        echo -e "${RED}${line}${NC}"
+      elif echo "$line" | grep -qiE "(sent|delivered|success|relay)"; then
+        echo -e "${GREEN}${line}${NC}"
+      elif echo "$line" | grep -qiE "(from=|to=)"; then
+        echo -e "${CYAN}${line}${NC}"
+      else
+        echo "$line"
+      fi
+    done
+    
+    # Если ничего не найдено, показываем последние логи Postfix
+    if [ -z "$email_logs" ]; then
+      echo -e "${YELLOW}Логи для конкретного письма не найдены. Показываем последние логи Postfix:${NC}"
+      echo ""
+      local postfix_logs=$(grep -i "postfix" "$log_file" 2>/dev/null | tail -30)
+      
+      # Проверяем наличие ошибки SMTPUTF8 в общих логах
+      if echo "$postfix_logs" | grep -qiE "SMTPUTF8.*required"; then
+        has_smtputf8_error=true
+      fi
+      
+      echo "$postfix_logs" | while IFS= read -r line; do
+        if echo "$line" | grep -qiE "(bounced|reject|error|fail|defer|SMTPUTF8)"; then
+          echo -e "${RED}${line}${NC}"
+        elif echo "$line" | grep -qiE "(sent|delivered|success|relay)"; then
+          echo -e "${GREEN}${line}${NC}"
+        else
+          echo "$line"
+        fi
+      done
+    fi
+    echo ""
+  fi
+  
+  # Финальная проверка наличия ошибки SMTPUTF8 в последних логах (на всякий случай)
+  # Проверяем логи, связанные с этим письмом
+  if grep -iE "postfix.*(${sender_email//./\\.}|${recipient_email//./\\.})" "$log_file" 2>/dev/null | tail -100 | grep -qiE "SMTPUTF8.*required"; then
+    has_smtputf8_error=true
+  fi
+  # Также проверяем общие логи Postfix
+  if tail -100 "$log_file" 2>/dev/null | grep -qiE "SMTPUTF8.*required"; then
+    has_smtputf8_error=true
+  fi
+  
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+  
+  # Если обнаружена ошибка SMTPUTF8, предлагаем исправление
+  # Дополнительная проверка перед показом меню
+  if [ "$has_smtputf8_error" != true ]; then
+    # Проверяем еще раз более тщательно
+    if tail -200 "$log_file" 2>/dev/null | grep -qiE "SMTPUTF8.*required"; then
+      has_smtputf8_error=true
+    fi
+  fi
+  
+  if [ "$has_smtputf8_error" = true ]; then
+    echo -e "${RED}${BOLD}⚠ ОБНАРУЖЕНА ПРОБЛЕМА: SMTPUTF8${NC}"
+    echo ""
+    echo -e "${YELLOW}В логах обнаружена ошибка: \"SMTPUTF8 is required, but was not offered\"${NC}"
+    echo -e "${YELLOW}Это означает, что Postfix пытается использовать SMTPUTF8, но сервер${NC}"
+    echo -e "${YELLOW}получателя (например, Yandex) не поддерживает эту функцию.${NC}"
+    echo ""
+    echo -e "${YELLOW}Выберите действие:${NC}"
+    echo -e "${CYAN}1.${NC} Исправить проблему SMTPUTF8 (отключить требование)"
+    echo -e "${CYAN}2.${NC} Продолжить просмотр логов"
+    echo ""
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo -n -e "${GREEN}Ваш выбор (1-2): ${NC}"
+    read fix_choice
+    
+    case $fix_choice in
+      1)
+        fix_smtputf8_issue
+        # После исправления возвращаемся к просмотру логов
+        view_email_logs "$sender_email" "$recipient_email"
+        return
+        ;;
+      2)
+        ;;
+      *)
+        ;;
+    esac
+  fi
+  
+  echo -e "${YELLOW}Полезные команды для просмотра логов Postfix:${NC}"
+  echo -e "${CYAN}•${NC} grep '${sender_email}\|${recipient_email}' ${log_file} (поиск по адресам)"
+  echo -e "${CYAN}•${NC} tail -f ${log_file} | grep -i postfix (просмотр логов Postfix в реальном времени)"
+  echo -e "${CYAN}•${NC} journalctl -t postfix -f (просмотр через journalctl в реальном времени)"
+  echo -e "${CYAN}•${NC} journalctl --since '10 minutes ago' | grep -i postfix (логи за последние 10 минут)"
+  echo ""
+  echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+  read
+}
+
 # Отправка тестового письма
 send_test_email() {
   local domain="$1"
@@ -1294,6 +1763,43 @@ EOF
     echo -e "${YELLOW}Кому:${NC} ${CYAN}${recipient_email}${NC}"
     echo ""
     echo -e "${YELLOW}Проверьте почтовый ящик получателя.${NC}"
+    echo ""
+    
+    # Меню действий после отправки
+    while true; do
+      echo -e "${YELLOW}Выберите действие:${NC}"
+      echo -e "${CYAN}1.${NC} Просмотреть логи отправленного сообщения"
+      echo -e "${CYAN}2.${NC} Вернуться к деталям домена"
+      echo ""
+      echo -e "${YELLOW}---------------------------------------------${NC}"
+      echo -n -e "${GREEN}Ваш выбор (1-2): ${NC}"
+      read log_choice
+      
+      case $log_choice in
+        1)
+          view_email_logs "$sender_email" "$recipient_email"
+          # После просмотра логов возвращаемся к меню
+          clear_screen
+          echo -e "${BOLD}${CYAN}==============================================${NC}"
+          echo -e "${BOLD}${CYAN}     ОТПРАВКА ТЕСТОВОГО ПИСЬМА               ${NC}"
+          echo -e "${BOLD}${CYAN}==============================================${NC}"
+          echo ""
+          echo -e "${GREEN}${BOLD}Тестовое письмо успешно отправлено!${NC}"
+          echo ""
+          echo -e "${YELLOW}От:${NC} ${CYAN}${sender_email}${NC}"
+          echo -e "${YELLOW}Кому:${NC} ${CYAN}${recipient_email}${NC}"
+          echo ""
+          continue
+          ;;
+        2)
+          return 0
+          ;;
+        *)
+          echo -e "${RED}Некорректный выбор!${NC}"
+          sleep 1
+          ;;
+      esac
+    done
   else
     echo -e "${RED}Ошибка при отправке письма.${NC}"
     echo ""
@@ -1301,6 +1807,9 @@ EOF
     echo -e "${CYAN}1.${NC} Статус сервиса Postfix: systemctl status postfix"
     echo -e "${CYAN}2.${NC} Логи Postfix: journalctl -u postfix -n 50"
     echo -e "${CYAN}3.${NC} Настройки DNS для домена $domain"
+    echo ""
+    echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+    read
   fi
 }
 
