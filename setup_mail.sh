@@ -1934,15 +1934,25 @@ class MailEndpointHandler(http.server.BaseHTTPRequestHandler):
         pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(pattern, email) is not None
     
+    def is_html_content(self, message):
+        """Определение, является ли сообщение HTML"""
+        # Проверяем наличие HTML тегов в сообщении
+        html_pattern = r'<[a-z][\s\S]*>'
+        return bool(re.search(html_pattern, message, re.IGNORECASE))
+    
     def send_email(self, sender, recipient, subject, message):
         """Отправка письма через sendmail"""
         try:
+            # Определяем тип контента
+            is_html = self.is_html_content(message)
+            content_type = 'text/html; charset=UTF-8' if is_html else 'text/plain; charset=UTF-8'
+            
             # Формируем письмо в формате RFC 2822
             email_content = f"""From: {sender}
 To: {recipient}
 Subject: {subject}
 Date: {formatdate()}
-Content-Type: text/plain; charset=UTF-8
+Content-Type: {content_type}
 
 {message}
 """
