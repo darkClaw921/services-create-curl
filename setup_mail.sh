@@ -12,6 +12,7 @@ fi
 MAIL_CONFIG_DIR="/var/lib/mail-server"
 DOMAINS_LIST_FILE="${MAIL_CONFIG_DIR}/domains.list"
 MAILBOXES_LIST_FILE="${MAIL_CONFIG_DIR}/mailboxes.list"
+ENDPOINTS_LIST_FILE="${MAIL_CONFIG_DIR}/endpoints.list"
 
 # Цвета для красивого вывода
 GREEN='\033[0;32m'
@@ -93,6 +94,10 @@ init_mail_config() {
   
   if [ ! -f "$MAILBOXES_LIST_FILE" ]; then
     touch "$MAILBOXES_LIST_FILE"
+  fi
+  
+  if [ ! -f "$ENDPOINTS_LIST_FILE" ]; then
+    touch "$ENDPOINTS_LIST_FILE"
   fi
 }
 
@@ -1875,6 +1880,810 @@ show_dns_records() {
   echo -e "${BOLD}${CYAN}=====================================================${NC}"
 }
 
+# Создание Python HTTP сервера для endpoint отправки писем
+create_python_mail_endpoint_server() {
+  local port="$1"
+  local api_key="$2"
+  local script_path="/tmp/mail_endpoint_${port}.py"
+  
+  cat > "$script_path" << PYTHON_SERVER_EOF
+#!/usr/bin/env python3
+import http.server
+import socketserver
+import json
+import sys
+import subprocess
+import re
+from datetime import datetime
+from email.utils import formatdate
+
+class MailEndpointHandler(http.server.BaseHTTPRequestHandler):
+    def __init__(self, *args, api_key=None, **kwargs):
+        self.api_key = api_key
+        super().__init__(*args, **kwargs)
+    
+    def handle(self):
+        """Переопределяем handle для обработки ошибок"""
+        try:
+            super().handle()
+        except BrokenPipeError:
+            # Игнорируем ошибки разорванного соединения
+            self.log_message("Connection closed by client")
+        except Exception as e:
+            self.log_message(f"Error in handle: {str(e)}")
+            import traceback
+            self.log_message(traceback.format_exc())
+    
+    def log_message(self, format, *args):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        message = format % args
+        print(f"[{timestamp}] {message}")
+        # Логируем в файл
+        try:
+            with open("/var/lib/mail-server/logs/endpoint.log", "a") as f:
+                f.write(f"[{timestamp}] {message}\n")
+        except:
+            pass
+    
+    def log_request(self, code='-', size='-'):
+        """Логируем все входящие запросы"""
+        self.log_message('"%s" %s %s', self.requestline, str(code), str(size))
+    
+    def validate_email(self, email):
+        """Валидация email адреса"""
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(pattern, email) is not None
+    
+    def send_email(self, sender, recipient, subject, message):
+        """Отправка письма через sendmail"""
+        try:
+            # Формируем письмо в формате RFC 2822
+            email_content = f"""From: {sender}
+To: {recipient}
+Subject: {subject}
+Date: {formatdate()}
+Content-Type: text/plain; charset=UTF-8
+
+{message}
+"""
+            # Отправляем через sendmail
+            process = subprocess.Popen(
+                ['/usr/sbin/sendmail', '-f', sender, recipient],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = process.communicate(input=email_content.encode('utf-8'))
+            
+            if process.returncode == 0:
+                return True, None
+            else:
+                return False, stderr.decode('utf-8', errors='ignore')
+        except Exception as e:
+            return False, str(e)
+    
+    def do_POST(self):
+        """Обработка POST запросов"""
+        self.log_message(f"POST request received: {self.path} from {self.client_address[0]}")
+        
+        if self.path != '/send':
+            self.log_message(f"404: Path not found: {self.path}")
+            self.send_response(404)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Endpoint not found'}).encode())
+            return
+        
+        # Проверяем API ключ
+        api_key_header = self.headers.get('X-API-Key', '')
+        if not api_key_header:
+            self.log_message("401: Missing X-API-Key header")
+            self.send_response(401)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Unauthorized: Missing API key'}).encode())
+            return
+        
+        if api_key_header != self.api_key:
+            self.log_message(f"401: Invalid API key provided (expected: {self.api_key[:10]}..., got: {api_key_header[:10]}...)")
+            self.send_response(401)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Unauthorized: Invalid API key'}).encode())
+            return
+        
+        # Читаем тело запроса
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+        except (ValueError, TypeError):
+            content_length = 0
+        
+        if content_length == 0:
+            self.log_message("400: Empty request body")
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Empty request body'}).encode())
+            try:
+                self.wfile.flush()
+            except:
+                pass
+            return
+        
+        body_str = ""
+        try:
+            # Читаем тело запроса
+            body = self.rfile.read(content_length)
+            body_str = body.decode('utf-8')
+            self.log_message(f"Request body received ({content_length} bytes): {body_str[:500]}")
+            
+            # Парсим JSON
+            data = json.loads(body_str)
+            self.log_message(f"Parsed JSON successfully. Keys: {list(data.keys())}")
+            
+        except json.JSONDecodeError as e:
+            self.log_message(f"400: Invalid JSON - {str(e)}")
+            self.log_message(f"Body was: {repr(body_str[:500])}")
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            error_response = json.dumps({'error': f'Invalid JSON: {str(e)}', 'body_preview': body_str[:100]})
+            self.wfile.write(error_response.encode())
+            try:
+                self.wfile.flush()
+            except:
+                pass
+            return
+        except UnicodeDecodeError as e:
+            self.log_message(f"400: Invalid encoding - {str(e)}")
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Invalid encoding in request body'}).encode())
+            try:
+                self.wfile.flush()
+            except:
+                pass
+            return
+        except Exception as e:
+            self.log_message(f"500: Server error while reading request - {str(e)}")
+            import traceback
+            self.log_message(traceback.format_exc())
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': f'Server error: {str(e)}'}).encode())
+            try:
+                self.wfile.flush()
+            except:
+                pass
+            return
+        
+        # Проверяем наличие обязательных полей
+        required_fields = ['subject', 'message', 'from', 'to']
+        missing_fields = [field for field in required_fields if field not in data]
+        if missing_fields:
+            self.log_message(f"400: Missing required fields: {missing_fields}")
+            self.log_message(f"Received fields: {list(data.keys())}")
+            self.log_message(f"Data content: {str(data)[:500]}")
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            error_response = json.dumps({
+                'error': f'Missing required field: {missing_fields[0]}',
+                'missing_fields': missing_fields,
+                'received_fields': list(data.keys()),
+                'received_data': data
+            })
+            self.wfile.write(error_response.encode())
+            try:
+                self.wfile.flush()
+            except:
+                pass
+            return
+        
+        # Валидируем email адреса
+        if not self.validate_email(data['from']):
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Invalid sender email address'}).encode())
+            return
+        
+        if not self.validate_email(data['to']):
+            self.send_response(400)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Invalid recipient email address'}).encode())
+            return
+        
+        # Отправляем письмо
+        success, error = self.send_email(
+            data['from'],
+            data['to'],
+            data['subject'],
+            data['message']
+        )
+        
+        if success:
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            response = {
+                'status': 'success',
+                'message': 'Email sent successfully',
+                'from': data['from'],
+                'to': data['to'],
+                'subject': data['subject']
+            }
+            self.wfile.write(json.dumps(response).encode())
+            self.log_message(f"Email sent: {data['from']} -> {data['to']}, subject: {data['subject']}")
+        else:
+            self.send_response(500)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            response = {
+                'status': 'error',
+                'error': f'Failed to send email: {error}'
+            }
+            self.wfile.write(json.dumps(response).encode())
+            self.log_message(f"Failed to send email: {error}")
+    
+    def do_GET(self):
+        """Обработка GET запросов для проверки статуса"""
+        self.log_message(f"GET request received: {self.path} from {self.client_address[0]}")
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'ok', 'service': 'mail-endpoint'}).encode())
+            self.log_message("Health check: OK")
+        else:
+            self.log_message(f"404: GET path not found: {self.path}")
+            self.send_response(404)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Not found'}).encode())
+
+class MailEndpointServer(socketserver.TCPServer):
+    def __init__(self, server_address, RequestHandlerClass, api_key):
+        self.api_key = api_key
+        # Разрешаем переиспользование адреса
+        self.allow_reuse_address = True
+        # Увеличиваем размер буфера для больших запросов
+        self.request_queue_size = 128
+        super().__init__(server_address, RequestHandlerClass)
+    
+    def finish_request(self, request, client_address):
+        """Переопределяем для передачи api_key в handler"""
+        try:
+            self.RequestHandlerClass(request, client_address, self, api_key=self.api_key)
+        except Exception as e:
+            import traceback
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                with open("/var/lib/mail-server/logs/endpoint.log", "a") as f:
+                    f.write(f"[{timestamp}] [ERROR] Error in finish_request: {str(e)}\n")
+                    f.write(traceback.format_exc())
+            except:
+                pass
+
+def run_server(port=8080, api_key=""):
+    try:
+        # Создаем директорию для логов если не существует
+        import os
+        os.makedirs("/var/lib/mail-server/logs", exist_ok=True)
+        
+        # Создаем сервер с передачей api_key
+        with MailEndpointServer(("0.0.0.0", port), MailEndpointHandler, api_key) as httpd:
+            print(f"Mail endpoint server running on 0.0.0.0:{port}")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                with open("/var/lib/mail-server/logs/endpoint.log", "a") as f:
+                    f.write(f"[{timestamp}] [INFO] Mail endpoint server started on 0.0.0.0:{port}\n")
+            except:
+                pass
+            httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped by user")
+    except Exception as e:
+        print(f"Server error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    return 0
+
+if __name__ == "__main__":
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
+    api_key = sys.argv[2] if len(sys.argv) > 2 else ""
+    sys.exit(run_server(port, api_key))
+PYTHON_SERVER_EOF
+
+  echo "$script_path"
+}
+
+# Создание endpoint для отправки писем
+create_mail_endpoint() {
+  clear_screen
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo -e "${BOLD}${CYAN}     СОЗДАНИЕ ENDPOINT ДЛЯ ОТПРАВКИ ПИСЕМ      ${NC}"
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+  
+  # Проверяем наличие Python3
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${RED}Python3 не установлен в системе.${NC}"
+    echo -e "${YELLOW}Установите Python3 для использования этой функции.${NC}"
+    echo ""
+    echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+    read
+    return 1
+  fi
+  
+  # Запрашиваем порт
+  echo -e "${YELLOW}Введите данные для endpoint:${NC}"
+  echo ""
+  echo -n -e "${GREEN}Порт для HTTP сервера (например, 8080): ${NC}"
+  read port
+  
+  # Проверяем корректность порта
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    echo -e "${RED}Некорректный порт! Укажите число от 1 до 65535.${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  # Проверяем, занят ли порт
+  if ss -tuln 2>/dev/null | grep -q ":${port} " || netstat -tuln 2>/dev/null | grep -q ":${port} "; then
+    echo -e "${RED}Порт $port уже занят!${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  # Проверяем и открываем порт в firewall
+  echo ""
+  echo -e "${YELLOW}Проверка firewall...${NC}"
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status | grep -q "Status: active"; then
+      if ! ufw status | grep -q "${port}"; then
+        echo -e "${YELLOW}Открытие порта $port в firewall (ufw)...${NC}"
+        ufw allow ${port}/tcp 2>/dev/null || true
+        echo -e "${GREEN}Порт $port открыт в firewall.${NC}"
+      else
+        echo -e "${GREEN}Порт $port уже открыт в firewall.${NC}"
+      fi
+    else
+      echo -e "${YELLOW}Firewall (ufw) не активен.${NC}"
+    fi
+  elif command -v firewall-cmd >/dev/null 2>&1; then
+    echo -e "${YELLOW}Проверка firewall (firewalld)...${NC}"
+    if firewall-cmd --state 2>/dev/null | grep -q "running"; then
+      if ! firewall-cmd --list-ports 2>/dev/null | grep -q "${port}/tcp"; then
+        echo -e "${YELLOW}Открытие порта $port в firewall (firewalld)...${NC}"
+        firewall-cmd --permanent --add-port=${port}/tcp 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
+        echo -e "${GREEN}Порт $port открыт в firewall.${NC}"
+      else
+        echo -e "${GREEN}Порт $port уже открыт в firewall.${NC}"
+      fi
+    fi
+  else
+    echo -e "${YELLOW}Firewall не обнаружен. Убедитесь, что порт $port открыт вручную.${NC}"
+  fi
+  
+  # Проверяем, существует ли уже endpoint на этом порту
+  if grep -q "^${port}:" "$ENDPOINTS_LIST_FILE" 2>/dev/null; then
+    echo -e "${YELLOW}Endpoint на порту $port уже существует.${NC}"
+    echo -n -e "${RED}Перезаписать существующий endpoint? (y/n): ${NC}"
+    read overwrite
+    
+    if [[ "$overwrite" != "y" && "$overwrite" != "Y" ]]; then
+      echo -e "${YELLOW}Создание endpoint отменено.${NC}"
+      sleep 2
+      return 1
+    fi
+    
+    # Удаляем старый endpoint
+    local old_service_name="mail-endpoint-${port}"
+    systemctl stop "${old_service_name}.service" 2>/dev/null
+    systemctl disable "${old_service_name}.service" 2>/dev/null
+    rm -f "/etc/systemd/system/${old_service_name}.service"
+    systemctl daemon-reload
+    
+    # Удаляем из списка
+    local temp_file=$(mktemp)
+    grep -v "^${port}:" "$ENDPOINTS_LIST_FILE" > "$temp_file" 2>/dev/null || true
+    mv "$temp_file" "$ENDPOINTS_LIST_FILE"
+  fi
+  
+  # Генерируем или запрашиваем API ключ
+  echo ""
+  echo -e "${YELLOW}Настройка API ключа для аутентификации:${NC}"
+  echo -e "${CYAN}1.${NC} Автоматически сгенерировать ключ"
+  echo -e "${CYAN}2.${NC} Ввести ключ вручную"
+  echo ""
+  echo -n -e "${GREEN}Ваш выбор (1-2): ${NC}"
+  read key_choice
+  
+  if [ "$key_choice" = "2" ]; then
+    echo -n -e "${GREEN}Введите API ключ: ${NC}"
+    read api_key
+    if [ -z "$api_key" ]; then
+      echo -e "${RED}API ключ не может быть пустым!${NC}"
+      sleep 2
+      return 1
+    fi
+  else
+    # Генерируем случайный ключ
+    api_key=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-40)
+    echo -e "${GREEN}Сгенерирован API ключ: ${api_key}${NC}"
+  fi
+  
+  echo ""
+  echo -e "${YELLOW}Создание Python HTTP сервера...${NC}"
+  
+  # Создаем Python скрипт
+  local script_path=$(create_python_mail_endpoint_server "$port" "$api_key")
+  
+  if [ ! -f "$script_path" ]; then
+    echo -e "${RED}Не удалось создать Python скрипт.${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  # Делаем скрипт исполняемым
+  chmod +x "$script_path"
+  
+  # Проверяем синтаксис Python скрипта
+  if ! python3 -m py_compile "$script_path" 2>/dev/null; then
+    echo -e "${RED}Ошибка синтаксиса Python скрипта.${NC}"
+    rm -f "$script_path" 2>/dev/null
+    sleep 2
+    return 1
+  fi
+  
+  echo -e "${GREEN}Python скрипт создан: $script_path${NC}"
+  
+  # Создаем директорию для логов
+  mkdir -p /var/lib/mail-server/logs
+  
+  # Создаем systemd сервис
+  local service_name="mail-endpoint-${port}"
+  local user=$(whoami)
+  
+  cat > "/etc/systemd/system/${service_name}.service" << EOF
+[Unit]
+Description=Mail Endpoint Server on port ${port}
+After=network.target postfix.service
+
+[Service]
+Type=simple
+User=${user}
+WorkingDirectory=/tmp
+ExecStart=/usr/bin/python3 ${script_path} ${port} ${api_key}
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  echo -e "${GREEN}Systemd сервис создан: ${service_name}.service${NC}"
+  
+  # Сохраняем информацию о endpoint
+  echo "${port}:${api_key}:${service_name}:$(date '+%Y-%m-%d %H:%M:%S')" >> "$ENDPOINTS_LIST_FILE"
+  
+  # Перезагружаем конфигурацию systemd
+  echo -e "${YELLOW}Перезагрузка конфигурации systemd...${NC}"
+  systemctl daemon-reload
+  
+  # Активируем автозапуск
+  echo -e "${YELLOW}Активация автозапуска сервиса...${NC}"
+  systemctl enable "${service_name}.service"
+  
+  # Спрашиваем, нужно ли запустить сервис сейчас
+  echo ""
+  echo -n -e "${GREEN}Хотите запустить endpoint сейчас? (y/n): ${NC}"
+  read start_now
+  
+  if [[ "$start_now" == "y" || "$start_now" == "Y" ]]; then
+    echo -e "${YELLOW}Запуск endpoint...${NC}"
+    systemctl start "${service_name}.service"
+    sleep 2
+    
+    if systemctl is-active --quiet "${service_name}.service"; then
+      echo -e "${GREEN}${BOLD}Endpoint успешно запущен!${NC}"
+      echo ""
+      local server_ip=$(hostname -I | awk '{print $1}')
+      echo -e "${YELLOW}Информация о endpoint:${NC}"
+      echo -e "${CYAN}Порт:${NC} ${port}"
+      echo -e "${CYAN}API ключ:${NC} ${api_key}"
+      echo -e "${CYAN}URL:${NC} http://${server_ip}:${port}/send"
+      echo -e "${CYAN}Health check:${NC} http://${server_ip}:${port}/health"
+      echo ""
+      echo -e "${YELLOW}Пример использования с curl:${NC}"
+      echo -e "${CYAN}curl -X POST http://${server_ip}:${port}/send \\\\${NC}"
+      echo -e "${CYAN}  -H \"Content-Type: application/json\" \\\\${NC}"
+      echo -e "${CYAN}  -H \"X-API-Key: ${api_key}\" \\\\${NC}"
+      echo -e "${CYAN}  -d '{\"from\":\"sender@example.com\",\"to\":\"recipient@example.com\",\"subject\":\"Test\",\"message\":\"Hello\"}'${NC}"
+    else
+      echo -e "${RED}Ошибка при запуске endpoint.${NC}"
+      echo -e "${YELLOW}Проверьте логи: journalctl -u ${service_name} -n 50${NC}"
+    fi
+  else
+    echo -e "${GREEN}${BOLD}Endpoint настроен для автозапуска после перезагрузки.${NC}"
+    echo ""
+    echo -e "${YELLOW}Для запуска используйте:${NC}"
+    echo -e "${CYAN}systemctl start ${service_name}.service${NC}"
+  fi
+  
+  echo ""
+  echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"
+  read
+}
+
+# Управление endpoint'ами для отправки писем
+manage_mail_endpoints() {
+  while true; do
+    clear_screen
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo -e "${BOLD}${CYAN}     УПРАВЛЕНИЕ ENDPOINT ДЛЯ ОТПРАВКИ ПИСЕМ   ${NC}"
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo ""
+    
+    if [ ! -s "$ENDPOINTS_LIST_FILE" ]; then
+      echo -e "${YELLOW}Список созданных endpoint пуст.${NC}"
+      echo ""
+      echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+      read
+      return 0
+    fi
+    
+    echo -e "${YELLOW}Список созданных endpoint:${NC}"
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    
+    mapfile -t endpoints < "$ENDPOINTS_LIST_FILE"
+    
+    for i in "${!endpoints[@]}"; do
+      endpoint_info=(${endpoints[$i]//:/ })
+      endpoint_port="${endpoint_info[0]}"
+      endpoint_api_key="${endpoint_info[1]}"
+      endpoint_service="${endpoint_info[2]}"
+      endpoint_date="${endpoint_info[3]} ${endpoint_info[4]}"
+      
+      status=$(systemctl is-active "$endpoint_service" 2>/dev/null || echo "inactive")
+      if [ "$status" == "active" ]; then
+        status_text="${GREEN}активен${NC}"
+      else
+        status_text="${RED}неактивен${NC}"
+      fi
+      
+      echo -e "${CYAN}$((i+1)).${NC} ${BOLD}Порт: ${endpoint_port}${NC} (${status_text})"
+      echo -e "   ${YELLOW}Сервис:${NC} ${endpoint_service}"
+      echo -e "   ${YELLOW}API ключ:${NC} ${endpoint_api_key:0:10}...${endpoint_api_key:(-5)}"
+      echo -e "   ${YELLOW}Создан:${NC} ${endpoint_date}"
+      echo -e "${YELLOW}---------------------------------------------${NC}"
+    done
+    
+    echo ""
+    echo -e "${YELLOW}Выберите действие:${NC}"
+    echo -e "${CYAN}1.${NC} Выбрать endpoint для управления"
+    echo -e "${CYAN}2.${NC} Создать новый endpoint"
+    echo -e "${CYAN}3.${NC} Вернуться в главное меню"
+    echo ""
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo -n -e "${GREEN}Ваш выбор (1-3): ${NC}"
+    read action_choice
+    
+    if [ "$action_choice" -eq 1 ]; then
+      echo ""
+      echo -n -e "${GREEN}Введите номер endpoint для управления: ${NC}"
+      read endpoint_number
+      
+      if ! [[ "$endpoint_number" =~ ^[0-9]+$ ]] || [ "$endpoint_number" -lt 1 ] || [ "$endpoint_number" -gt ${#endpoints[@]} ]; then
+        echo -e "${RED}Некорректный выбор!${NC}"
+        sleep 2
+        continue
+      fi
+      
+      selected_endpoint=(${endpoints[$((endpoint_number-1))]//:/ })
+      endpoint_port="${selected_endpoint[0]}"
+      endpoint_api_key="${selected_endpoint[1]}"
+      endpoint_service="${selected_endpoint[2]}"
+      
+      # Меню управления endpoint
+      while true; do
+        clear_screen
+        echo -e "${BOLD}${CYAN}==============================================${NC}"
+        echo -e "${BOLD}${CYAN}   УПРАВЛЕНИЕ: Порт ${endpoint_port}              ${NC}"
+        echo -e "${BOLD}${CYAN}==============================================${NC}"
+        echo ""
+        
+        local status=$(systemctl is-active "$endpoint_service" 2>/dev/null || echo "inactive")
+        local enabled=$(systemctl is-enabled "$endpoint_service" 2>/dev/null || echo "disabled")
+        
+        local status_text=""
+        if [ "$status" == "active" ]; then
+          status_text="${GREEN}Активен${NC}"
+        else
+          status_text="${RED}Неактивен${NC}"
+        fi
+        
+        local enabled_text=""
+        if [ "$enabled" == "enabled" ]; then
+          enabled_text="${GREEN}Да${NC}"
+        else
+          enabled_text="${RED}Нет${NC}"
+        fi
+        
+        echo -e "${YELLOW}Информация о endpoint:${NC}"
+        echo -e "${YELLOW}---------------------------------------------${NC}"
+        echo -e "${BOLD}Порт:${NC} ${endpoint_port}"
+        echo -e "${BOLD}Статус:${NC} ${status_text}"
+        echo -e "${BOLD}Автозапуск:${NC} ${enabled_text}"
+        echo -e "${BOLD}Сервис:${NC} ${endpoint_service}"
+        echo -e "${BOLD}API ключ:${NC} ${endpoint_api_key}"
+        echo -e "${YELLOW}---------------------------------------------${NC}"
+        echo ""
+        
+        echo -e "${YELLOW}Выберите действие:${NC}"
+        echo -e "${CYAN}1.${NC} Запустить endpoint"
+        echo -e "${CYAN}2.${NC} Остановить endpoint"
+        echo -e "${CYAN}3.${NC} Перезапустить endpoint"
+        echo -e "${CYAN}4.${NC} Просмотреть журнал endpoint"
+        echo -e "${CYAN}5.${NC} Показать пример использования"
+        echo -e "${CYAN}6.${NC} Удалить endpoint"
+        echo -e "${CYAN}7.${NC} Вернуться к списку endpoint"
+        echo ""
+        echo -e "${YELLOW}---------------------------------------------${NC}"
+        echo -n -e "${GREEN}Ваш выбор (1-7): ${NC}"
+        read control_option
+        
+        case $control_option in
+          1) # Запустить
+            echo -e "${YELLOW}Запуск endpoint...${NC}"
+            systemctl start "$endpoint_service"
+            sleep 1
+            if systemctl is-active --quiet "$endpoint_service"; then
+              echo -e "${GREEN}Endpoint успешно запущен!${NC}"
+            else
+              echo -e "${RED}Ошибка при запуске endpoint.${NC}"
+              echo -e "${YELLOW}Проверьте логи: journalctl -u ${endpoint_service} -n 50${NC}"
+            fi
+            echo ""
+            echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"
+            read
+            ;;
+          2) # Остановить
+            echo -e "${YELLOW}Остановка endpoint...${NC}"
+            systemctl stop "$endpoint_service"
+            sleep 1
+            echo -e "${GREEN}Endpoint остановлен.${NC}"
+            echo ""
+            echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"
+            read
+            ;;
+          3) # Перезапустить
+            echo -e "${YELLOW}Перезапуск endpoint...${NC}"
+            systemctl restart "$endpoint_service"
+            sleep 1
+            if systemctl is-active --quiet "$endpoint_service"; then
+              echo -e "${GREEN}Endpoint успешно перезапущен!${NC}"
+            else
+              echo -e "${RED}Ошибка при перезапуске endpoint.${NC}"
+            fi
+            echo ""
+            echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"
+            read
+            ;;
+          4) # Просмотр журнала
+            clear_screen
+            echo -e "${BOLD}${CYAN}==============================================${NC}"
+            echo -e "${BOLD}${CYAN}       ЖУРНАЛ ENDPOINT ${endpoint_service}         ${NC}"
+            echo -e "${BOLD}${CYAN}==============================================${NC}"
+            echo ""
+            echo -e "${YELLOW}Последние 50 строк журнала:${NC}"
+            echo -e "${YELLOW}---------------------------------------------${NC}"
+            echo ""
+            journalctl -u "$endpoint_service" -n 50 --no-pager
+            echo ""
+            echo -e "${YELLOW}---------------------------------------------${NC}"
+            echo ""
+            echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+            read
+            ;;
+          5) # Показать пример использования
+            clear_screen
+            local server_ip=$(hostname -I | awk '{print $1}')
+            echo -e "${BOLD}${CYAN}==============================================${NC}"
+            echo -e "${BOLD}${CYAN}     ПРИМЕР ИСПОЛЬЗОВАНИЯ ENDPOINT            ${NC}"
+            echo -e "${BOLD}${CYAN}==============================================${NC}"
+            echo ""
+            echo -e "${YELLOW}URL:${NC} http://${server_ip}:${endpoint_port}/send"
+            echo -e "${YELLOW}Метод:${NC} POST"
+            echo -e "${YELLOW}Заголовки:${NC}"
+            echo -e "  ${CYAN}Content-Type:${NC} application/json"
+            echo -e "  ${CYAN}X-API-Key:${NC} ${endpoint_api_key}"
+            echo ""
+            echo -e "${YELLOW}Тело запроса (JSON):${NC}"
+            echo -e "${CYAN}{${NC}"
+            echo -e "${CYAN}  \"from\": \"sender@example.com\",${NC}"
+            echo -e "${CYAN}  \"to\": \"recipient@example.com\",${NC}"
+            echo -e "${CYAN}  \"subject\": \"Тема письма\",${NC}"
+            echo -e "${CYAN}  \"message\": \"Текст сообщения\"${NC}"
+            echo -e "${CYAN}}${NC}"
+            echo ""
+            echo -e "${YELLOW}Пример с curl:${NC}"
+            echo -e "${CYAN}curl -X POST http://${server_ip}:${endpoint_port}/send \\\\${NC}"
+            echo -e "${CYAN}  -H \"Content-Type: application/json\" \\\\${NC}"
+            echo -e "${CYAN}  -H \"X-API-Key: ${endpoint_api_key}\" \\\\${NC}"
+            echo -e "${CYAN}  -d '{\"from\":\"sender@example.com\",\"to\":\"recipient@example.com\",\"subject\":\"Test\",\"message\":\"Hello\"}'${NC}"
+            echo ""
+            echo -e "${YELLOW}Health check:${NC}"
+            echo -e "${CYAN}curl http://${server_ip}:${endpoint_port}/health${NC}"
+            echo ""
+            echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+            read
+            ;;
+          6) # Удалить
+            echo -e "${RED}${BOLD}Вы уверены, что хотите удалить endpoint на порту ${endpoint_port}? (y/n): ${NC}"
+            read confirm_delete
+            
+            if [[ "$confirm_delete" == "y" || "$confirm_delete" == "Y" ]]; then
+              echo -e "${YELLOW}Удаление endpoint...${NC}"
+              
+              # Останавливаем сервис
+              systemctl stop "$endpoint_service" 2>/dev/null
+              systemctl disable "$endpoint_service" 2>/dev/null
+              
+              # Удаляем файл сервиса
+              rm -f "/etc/systemd/system/${endpoint_service}.service"
+              
+              # Перезагружаем конфигурацию systemd
+              systemctl daemon-reload
+              
+              # Удаляем запись из списка
+              local temp_file=$(mktemp)
+              grep -v "^${endpoint_port}:" "$ENDPOINTS_LIST_FILE" > "$temp_file" 2>/dev/null || true
+              mv "$temp_file" "$ENDPOINTS_LIST_FILE"
+              
+              # Удаляем Python скрипт
+              rm -f "/tmp/mail_endpoint_${endpoint_port}.py"
+              
+              echo -e "${GREEN}${BOLD}Endpoint успешно удален.${NC}"
+              sleep 2
+              break
+            else
+              echo -e "${YELLOW}Удаление отменено.${NC}"
+              sleep 1
+            fi
+            ;;
+          7) # Вернуться к списку
+            break
+            ;;
+          *)
+            echo -e "${RED}Некорректный выбор!${NC}"
+            sleep 1
+            ;;
+        esac
+      done
+    elif [ "$action_choice" -eq 2 ]; then
+      create_mail_endpoint
+    elif [ "$action_choice" -eq 3 ]; then
+      return 0
+    else
+      echo -e "${RED}Некорректный выбор!${NC}"
+      sleep 1
+    fi
+  done
+}
+
 # Очистка всех данных, созданных скриптом
 cleanup_all() {
   clear_screen
@@ -1951,10 +2760,25 @@ SQL
     echo -e "${GREEN}Конфигурация OpenDKIM очищена.${NC}"
   fi
   
+  # Удаляем endpoint'ы
+  echo -e "${YELLOW}Удаление endpoint'ов для отправки писем...${NC}"
+  if [ -f "$ENDPOINTS_LIST_FILE" ] && [ -s "$ENDPOINTS_LIST_FILE" ]; then
+    while IFS=: read -r port api_key service_name rest; do
+      if [ -n "$service_name" ]; then
+        systemctl stop "${service_name}.service" 2>/dev/null || true
+        systemctl disable "${service_name}.service" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${service_name}.service"
+        rm -f "/tmp/mail_endpoint_${port}.py"
+      fi
+    done < "$ENDPOINTS_LIST_FILE"
+    echo -e "${GREEN}Endpoint'ы удалены.${NC}"
+  fi
+  
   # Удаляем файлы со списками
   echo -e "${YELLOW}Удаление файлов со списками...${NC}"
   rm -f "$DOMAINS_LIST_FILE"
   rm -f "$MAILBOXES_LIST_FILE"
+  rm -f "$ENDPOINTS_LIST_FILE"
   echo -e "${GREEN}Файлы со списками удалены.${NC}"
   
   # Удаляем пользователя vmail и его директорию
@@ -1993,11 +2817,13 @@ show_main_menu() {
     echo -e "${CYAN}1.${NC} Установить почтовый сервер"
     echo -e "${CYAN}2.${NC} Добавить домен/почтовый ящик"
     echo -e "${CYAN}3.${NC} Просмотреть домены и почтовые ящики"
-    echo -e "${CYAN}4.${NC} Очистить все данные почтового сервера"
-    echo -e "${CYAN}5.${NC} Завершить работу скрипта"
+    echo -e "${CYAN}4.${NC} Создать endpoint для отправки писем"
+    echo -e "${CYAN}5.${NC} Управление endpoint для отправки писем"
+    echo -e "${CYAN}6.${NC} Очистить все данные почтового сервера"
+    echo -e "${CYAN}7.${NC} Завершить работу скрипта"
     echo ""
     echo -e "${YELLOW}---------------------------------------------${NC}"
-    echo -n -e "${GREEN}Ваш выбор (1-5): ${NC}"
+    echo -n -e "${GREEN}Ваш выбор (1-7): ${NC}"
     read main_choice
     
     case $main_choice in
@@ -2019,9 +2845,15 @@ show_main_menu() {
         view_domains_mailboxes
         ;;
       4)
-        cleanup_all
+        create_mail_endpoint
         ;;
       5)
+        manage_mail_endpoints
+        ;;
+      6)
+        cleanup_all
+        ;;
+      7)
         clear_screen
         echo -e "${GREEN}${BOLD}Завершение работы скрипта. До свидания!${NC}"
         return 0
