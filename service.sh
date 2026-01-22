@@ -776,17 +776,31 @@ list_nginx_configs() {
 # Функция для отображения информации о конфигурации nginx
 show_nginx_config_info() {
   local config_file="$1"
-      local filename=$(basename "$config_file")
-      
-      # Извлекаем server_name
-      local server_names=$(grep -E "^\s*server_name" "$config_file" | sed 's/^\s*server_name\s*//' | sed 's/;//' | tr '\n' ' ')
-      
-      # Извлекаем порты из listen директив
-      local listen_ports=$(grep -E "^\s*listen" "$config_file" | grep -oE "[0-9]+" | sort -u | tr '\n' ' ')
-      
-      # Извлекаем proxy_pass если есть
-      local proxy_passes=$(grep -E "^\s*proxy_pass" "$config_file" | sed 's/^\s*proxy_pass\s*//' | sed 's/;//' | tr '\n' ' ')
-      
+  local filename=$(basename "$config_file")
+  
+  # Извлекаем server_name
+  local server_names=$(grep -E "^\s*server_name" "$config_file" | sed 's/^\s*server_name\s*//' | sed 's/;//' | tr '\n' ' ')
+  
+  # Извлекаем порты из listen директив
+  local listen_ports=$(grep -E "^\s*listen" "$config_file" | grep -oE "[0-9]+" | sort -u | tr '\n' ' ')
+  
+  # Извлекаем proxy_pass если есть
+  local proxy_passes=$(grep -E "^\s*proxy_pass" "$config_file" | sed 's/^\s*proxy_pass\s*//' | sed 's/;//' | tr '\n' ' ')
+  
+  # Определяем тип проксирования
+  local proxy_type=""
+  if echo "$proxy_passes" | grep -q "127.0.0.1\|localhost"; then
+    proxy_type="${CYAN}Локальный${NC}"
+  elif [ ! -z "$proxy_passes" ]; then
+    proxy_type="${BLUE}Внешний${NC}"
+  fi
+  
+  # Проверяем наличие wildcard
+  local is_wildcard=false
+  if echo "$server_names" | grep -q "\*"; then
+    is_wildcard=true
+  fi
+  
   # Проверяем наличие SSL
   local has_ssl=false
   if grep -qE "^\s*listen\s+443" "$config_file" || grep -qE "ssl_certificate" "$config_file"; then
@@ -801,27 +815,34 @@ show_nginx_config_info() {
   fi
   
   echo -e "${CYAN}${BOLD}Файл:${NC} $filename"
-      if [ ! -z "$server_names" ]; then
-        echo -e "${YELLOW}  Домены:${NC} $server_names"
-      fi
-      if [ ! -z "$listen_ports" ]; then
-        echo -e "${GREEN}  Порты:${NC} $listen_ports"
-      else
-        echo -e "${RED}  Порты: не найдены${NC}"
-      fi
-      if [ ! -z "$proxy_passes" ]; then
-        echo -e "${BLUE}  Проксирование:${NC} $proxy_passes"
-      fi
+  if [ ! -z "$server_names" ]; then
+    if [ "$is_wildcard" = true ]; then
+      echo -e "${YELLOW}  Домены:${NC} ${GREEN}${BOLD}[WILDCARD]${NC} $server_names"
+    else
+      echo -e "${YELLOW}  Домены:${NC} $server_names"
+    fi
+  fi
+  if [ ! -z "$listen_ports" ]; then
+    echo -e "${GREEN}  Порты:${NC} $listen_ports"
+  else
+    echo -e "${RED}  Порты: не найдены${NC}"
+  fi
+  if [ ! -z "$proxy_passes" ]; then
+    echo -e "${BLUE}  Проксирование:${NC} $proxy_passes"
+    if [ ! -z "$proxy_type" ]; then
+      echo -e "${BLUE}  Тип проксирования:${NC} $proxy_type"
+    fi
+  fi
   if [ "$has_ssl" = true ]; then
     echo -e "${GREEN}  SSL: настроен${NC}"
   else
     echo -e "${RED}  SSL: не настроен${NC}"
   fi
   if [ "$is_enabled" = true ]; then
-        echo -e "${GREEN}  Статус: АКТИВИРОВАН${NC}"
-      else
-        echo -e "${RED}  Статус: не активирован${NC}"
-      fi
+    echo -e "${GREEN}  Статус: АКТИВИРОВАН${NC}"
+  else
+    echo -e "${RED}  Статус: не активирован${NC}"
+  fi
 }
 
 # Функция для удаления конфигурации nginx
@@ -1058,61 +1079,33 @@ toggle_nginx_config() {
   return 0
 }
 
-# Функция для выпуска SSL сертификата с автообновлением
-issue_ssl_certificate() {
+# Функция для выпуска wildcard SSL сертификата через DNS challenge
+issue_wildcard_certificate() {
   local config_filename="$1"
   local config_path="/etc/nginx/sites-available/${config_filename}"
+  local wildcard_domain="$2"
+  local base_domain="$3"
   
   clear_screen
   echo -e "${BOLD}${CYAN}==============================================${NC}"
-  echo -e "${BOLD}${CYAN}   ВЫПУСК SSL СЕРТИФИКАТА С АВТООБНОВЛЕНИЕМ    ${NC}"
+  echo -e "${BOLD}${CYAN}  ВЫПУСК WILDCARD SSL СЕРТИФИКАТА (DNS)        ${NC}"
   echo -e "${BOLD}${CYAN}==============================================${NC}"
   echo ""
   
-  if [ ! -f "$config_path" ]; then
-    echo -e "${RED}Конфигурация $config_filename не найдена!${NC}"
-    sleep 2
-    return 1
-  fi
-  
-  # Извлекаем домен из конфигурации
-  local domain=$(grep -E "^\s*server_name" "$config_path" | head -1 | sed 's/^\s*server_name\s*//' | sed 's/;//' | awk '{print $1}')
-  
-  if [ -z "$domain" ]; then
-    echo -e "${RED}Не удалось определить домен из конфигурации!${NC}"
-    echo -n -e "${GREEN}Введите домен вручную: ${NC}"
-    read domain
-  fi
-  
-  if [ -z "$domain" ]; then
-    echo -e "${RED}Домен не может быть пустым!${NC}"
-    sleep 2
-    return 1
-  fi
-  
-  echo -e "${YELLOW}Информация о конфигурации:${NC}"
-  echo -e "${YELLOW}---------------------------------------------${NC}"
-  show_nginx_config_info "$config_path"
-  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo -e "${YELLOW}Для выпуска wildcard сертификата требуется DNS challenge.${NC}"
+  echo -e "${YELLOW}Вам нужно будет добавить TXT запись в DNS зону домена.${NC}"
   echo ""
-  echo -e "${YELLOW}Домен для сертификата: ${BOLD}$domain${NC}"
+  echo -e "${CYAN}Wildcard домен: ${BOLD}*.${base_domain}${NC}"
+  echo -e "${CYAN}Базовый домен: ${BOLD}${base_domain}${NC}"
   echo ""
   
   # Проверяем наличие certbot
   if ! command -v certbot &> /dev/null; then
     echo -e "${RED}Certbot не установлен в системе.${NC}"
     echo -e "${YELLOW}Установите certbot для выпуска SSL сертификатов.${NC}"
-    echo -e "${YELLOW}Например: sudo apt install certbot python3-certbot-nginx${NC}"
+    echo -e "${YELLOW}Например: sudo apt install certbot${NC}"
     sleep 3
     return 1
-  fi
-  
-  # Проверяем, активирована ли конфигурация
-  local enabled_path="/etc/nginx/sites-enabled/${config_filename}"
-  if [ ! -L "$enabled_path" ]; then
-    echo -e "${YELLOW}Конфигурация не активирована. Активируем...${NC}"
-    ln -s "$config_path" "$enabled_path"
-    systemctl reload nginx
   fi
   
   # Проверяем наличие зарегистрированного аккаунта certbot
@@ -1140,25 +1133,169 @@ issue_ssl_certificate() {
   fi
   
   echo ""
-  echo -e "${YELLOW}Выпуск SSL сертификата для домена $domain...${NC}"
+  echo -e "${YELLOW}Запуск certbot для выпуска wildcard сертификата...${NC}"
   echo -e "${YELLOW}---------------------------------------------${NC}"
   echo ""
+  echo -e "${CYAN}Certbot запросит у вас добавление DNS TXT записи.${NC}"
+  echo -e "${CYAN}Следуйте инструкциям на экране.${NC}"
+  echo ""
+  echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"
+  read
   
-  # Запускаем certbot с параметрами
+  # Запускаем certbot с DNS challenge (интерактивный режим обязателен для DNS challenge)
+  local certbot_cmd="certbot certonly --manual --preferred-challenges dns"
+  
   if [ "$certbot_registered" = false ]; then
-    certbot --nginx -d "$domain" --non-interactive --agree-tos --redirect $email_param
-  else
-    certbot --nginx -d "$domain"
+    # Для нового аккаунта добавляем email и согласие с условиями
+    certbot_cmd="$certbot_cmd --agree-tos $email_param"
   fi
+  
+  certbot_cmd="$certbot_cmd -d \"*.${base_domain}\" -d \"${base_domain}\""
+  
+  echo -e "${YELLOW}Выполняется команда:${NC}"
+  echo -e "${CYAN}${certbot_cmd}${NC}"
+  echo ""
+  echo -e "${YELLOW}Внимание: Certbot будет работать в интерактивном режиме.${NC}"
+  echo -e "${YELLOW}Когда certbot попросит добавить DNS TXT запись, сделайте это и нажмите Enter.${NC}"
+  echo ""
+  
+  # Выполняем certbot (интерактивный режим)
+  eval "$certbot_cmd"
   
   if [ $? -eq 0 ]; then
     echo ""
-    echo -e "${GREEN}${BOLD}SSL сертификат успешно выпущен и настроен!${NC}"
+    echo -e "${GREEN}${BOLD}Wildcard SSL сертификат успешно выпущен!${NC}"
     
-    # Настраиваем автообновление через systemd timer (если еще не настроено)
+    # Настраиваем nginx для использования wildcard сертификата
+    echo -e "${YELLOW}Настройка nginx для использования wildcard сертификата...${NC}"
+    
+    # Определяем пути к сертификатам (может быть base_domain или base_domain-0001 и т.д.)
+    local cert_dir=""
+    
+    # Ищем все директории, начинающиеся с base_domain
+    local possible_dirs=$(ls -1 /etc/letsencrypt/live/ 2>/dev/null | grep "^${base_domain}" | sort)
+    
+    if [ -z "$possible_dirs" ]; then
+      echo -e "${RED}Не удалось найти директорию с сертификатом для домена ${base_domain}!${NC}"
+      echo -e "${YELLOW}Доступные директории в /etc/letsencrypt/live/:${NC}"
+      ls -1 /etc/letsencrypt/live/ 2>/dev/null | head -5
+      sleep 3
+      return 1
+    fi
+    
+    # Проверяем каждую директорию на наличие файлов сертификата
+    for dir in $possible_dirs; do
+      local test_cert="/etc/letsencrypt/live/${dir}/fullchain.pem"
+      local test_key="/etc/letsencrypt/live/${dir}/privkey.pem"
+      
+      if [ -f "$test_cert" ] && [ -f "$test_key" ]; then
+        cert_dir="$dir"
+        break
+      fi
+    done
+    
+    if [ -z "$cert_dir" ]; then
+      echo -e "${RED}Не удалось найти файлы сертификата в директориях для домена ${base_domain}!${NC}"
+      echo -e "${YELLOW}Проверенные директории:${NC}"
+      echo "$possible_dirs" | while read dir; do
+        echo -e "${CYAN}  /etc/letsencrypt/live/${dir}${NC}"
+      done
+      sleep 3
+      return 1
+    fi
+    
+    local cert_path="/etc/letsencrypt/live/${cert_dir}/fullchain.pem"
+    local key_path="/etc/letsencrypt/live/${cert_dir}/privkey.pem"
+    
+    echo -e "${GREEN}Найден сертификат в директории: ${cert_dir}${NC}"
+    
+    # Создаем резервную копию конфигурации
+    local backup_path="${config_path}.backup.$(date +%Y%m%d_%H%M%S)"
+    cp "$config_path" "$backup_path"
+    echo -e "${GREEN}Создана резервная копия: ${backup_path}${NC}"
+    
+    # Читаем текущую конфигурацию и добавляем SSL блок
+    local temp_config=$(mktemp)
+    
+    # Извлекаем proxy_pass из текущей конфигурации
+    local proxy_pass_value=$(grep -E "^\s*proxy_pass" "$config_path" | sed 's/^\s*proxy_pass\s*//' | sed 's/;//' | head -1)
+    
+    # Проверяем, есть ли уже ssl_session_cache в основной конфигурации nginx
+    local has_ssl_cache=false
+    if grep -q "ssl_session_cache" /etc/nginx/nginx.conf 2>/dev/null; then
+      has_ssl_cache=true
+    fi
+    
+    # Создаем новую конфигурацию с SSL
+    cat > "$temp_config" << EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name *.${base_domain} ${base_domain};
+    
+    # Редирект на HTTPS
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name *.${base_domain} ${base_domain};
+    
+    ssl_certificate ${cert_path};
+    ssl_certificate_key ${key_path};
+    
+    # SSL настройки
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
+EOF
+    
+    # Добавляем ssl_session_cache только если его нет в основной конфигурации
+    if [ "$has_ssl_cache" = false ]; then
+      cat >> "$temp_config" << EOF
+    ssl_session_cache shared:SSL:10m;
+EOF
+    fi
+    
+    cat >> "$temp_config" << EOF
+    ssl_session_timeout 10m;
+    
+    location / {
+        proxy_pass ${proxy_pass_value};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+    
+    # Заменяем конфигурацию
+    mv "$temp_config" "$config_path"
+    
+    echo -e "${GREEN}Конфигурация nginx обновлена для использования wildcard сертификата.${NC}"
+    
+    # Проверяем конфигурацию nginx
+    echo -e "${YELLOW}Проверка конфигурации nginx...${NC}"
+    nginx -t
+    
+    if [ $? -eq 0 ]; then
+      echo -e "${YELLOW}Перезагрузка nginx...${NC}"
+      systemctl reload nginx
+      echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
+    else
+      echo -e "${RED}Ошибка в конфигурации nginx!${NC}"
+      echo -e "${YELLOW}Восстанавливаем резервную копию...${NC}"
+      mv "$backup_path" "$config_path"
+      systemctl reload nginx
+      sleep 3
+      return 1
+    fi
+    
+    # Настраиваем автообновление через systemd timer
     echo -e "${YELLOW}Проверка настроек автообновления certbot...${NC}"
     
-    # Проверяем наличие systemd таймера для certbot
     if systemctl list-timers | grep -q "certbot.timer"; then
       echo -e "${GREEN}Автообновление certbot уже настроено через systemd timer.${NC}"
     else
@@ -1175,23 +1312,190 @@ issue_ssl_certificate() {
       fi
     fi
     
-    # Проверяем конфигурацию nginx после изменений certbot
-    echo -e "${YELLOW}Проверка конфигурации nginx...${NC}"
-    nginx -t
-    
-    if [ $? -eq 0 ]; then
-      echo -e "${YELLOW}Перезагрузка nginx...${NC}"
-      systemctl reload nginx
-      echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
-    fi
+    echo ""
+    echo -e "${GREEN}${BOLD}Wildcard SSL сертификат успешно настроен!${NC}"
+    echo -e "${YELLOW}Примечание: Для обновления wildcard сертификата потребуется повторно добавить DNS TXT запись.${NC}"
   else
     echo ""
-    echo -e "${RED}Ошибка при выпуске SSL сертификата.${NC}"
+    echo -e "${RED}Ошибка при выпуске wildcard SSL сертификата.${NC}"
     echo -e "${YELLOW}Проверьте, что:${NC}"
-    echo -e "${YELLOW}  1. Домен $domain указывает на IP этого сервера${NC}"
-    echo -e "${YELLOW}  2. Порты 80 и 443 открыты в firewall${NC}"
-    echo -e "${YELLOW}  3. Nginx работает корректно${NC}"
-    echo -e "${YELLOW}  4. Конфигурация nginx активирована${NC}"
+    echo -e "${YELLOW}  1. Вы правильно добавили DNS TXT запись${NC}"
+    echo -e "${YELLOW}  2. DNS запись успешно распространилась (может занять несколько минут)${NC}"
+    echo -e "${YELLOW}  3. Вы подтвердили добавление записи в certbot${NC}"
+  fi
+  
+  sleep 5
+  return 0
+}
+
+# Функция для выпуска SSL сертификата с автообновлением
+issue_ssl_certificate() {
+  local config_filename="$1"
+  local config_path="/etc/nginx/sites-available/${config_filename}"
+  
+  clear_screen
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo -e "${BOLD}${CYAN}   ВЫПУСК SSL СЕРТИФИКАТА С АВТООБНОВЛЕНИЕМ    ${NC}"
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+  
+  if [ ! -f "$config_path" ]; then
+    echo -e "${RED}Конфигурация $config_filename не найдена!${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  # Извлекаем server_name из конфигурации
+  local server_names=$(grep -E "^\s*server_name" "$config_path" | head -1 | sed 's/^\s*server_name\s*//' | sed 's/;//')
+  
+  if [ -z "$server_names" ]; then
+    echo -e "${RED}Не удалось определить домен из конфигурации!${NC}"
+    echo -n -e "${GREEN}Введите домен вручную: ${NC}"
+    read server_names
+  fi
+  
+  if [ -z "$server_names" ]; then
+    echo -e "${RED}Домен не может быть пустым!${NC}"
+    sleep 2
+    return 1
+  fi
+  
+  # Определяем, является ли домен wildcard
+  local is_wildcard=false
+  local wildcard_domain=""
+  local base_domain=""
+  
+  # Проверяем наличие wildcard в server_name
+  if echo "$server_names" | grep -q "\*"; then
+    is_wildcard=true
+    # Извлекаем wildcard домен (*.example.com)
+    wildcard_domain=$(echo "$server_names" | grep -oE '\*\.?[^ ]+' | head -1)
+    # Извлекаем базовый домен
+    base_domain=$(echo "$wildcard_domain" | sed 's/^\*\.//')
+    if [ -z "$base_domain" ]; then
+      # Если не нашли в wildcard, берем первый домен из списка
+      base_domain=$(echo "$server_names" | awk '{print $NF}')
+    fi
+  else
+    # Обычный домен - берем первый из списка
+    base_domain=$(echo "$server_names" | awk '{print $1}')
+  fi
+  
+  echo -e "${YELLOW}Информация о конфигурации:${NC}"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  show_nginx_config_info "$config_path"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+  
+  if [ "$is_wildcard" = true ]; then
+    echo -e "${YELLOW}Обнаружен wildcard домен: ${BOLD}$wildcard_domain${NC}"
+    echo -e "${YELLOW}Базовый домен: ${BOLD}$base_domain${NC}"
+    echo ""
+    echo -e "${CYAN}Для wildcard домена требуется DNS challenge.${NC}"
+    echo ""
+    
+    # Используем функцию для wildcard сертификата
+    issue_wildcard_certificate "$config_filename" "$wildcard_domain" "$base_domain"
+    return $?
+  else
+    echo -e "${YELLOW}Домен для сертификата: ${BOLD}$base_domain${NC}"
+    echo ""
+    
+    # Проверяем наличие certbot
+    if ! command -v certbot &> /dev/null; then
+      echo -e "${RED}Certbot не установлен в системе.${NC}"
+      echo -e "${YELLOW}Установите certbot для выпуска SSL сертификатов.${NC}"
+      echo -e "${YELLOW}Например: sudo apt install certbot python3-certbot-nginx${NC}"
+      sleep 3
+      return 1
+    fi
+    
+    # Проверяем, активирована ли конфигурация
+    local enabled_path="/etc/nginx/sites-enabled/${config_filename}"
+    if [ ! -L "$enabled_path" ]; then
+      echo -e "${YELLOW}Конфигурация не активирована. Активируем...${NC}"
+      ln -s "$config_path" "$enabled_path"
+      systemctl reload nginx
+    fi
+    
+    # Проверяем наличие зарегистрированного аккаунта certbot
+    local certbot_registered=false
+    if [ -d "/etc/letsencrypt/accounts" ] && [ -n "$(ls -A /etc/letsencrypt/accounts 2>/dev/null)" ]; then
+      certbot_registered=true
+    fi
+    
+    # Если аккаунт не зарегистрирован, запрашиваем email
+    local email_param=""
+    if [ "$certbot_registered" = false ]; then
+      echo -e "${YELLOW}Для выпуска SSL сертификата требуется email адрес.${NC}"
+      echo -e "${YELLOW}Он будет использован для уведомлений об истечении сертификата.${NC}"
+      echo ""
+      echo -n -e "${GREEN}Введите email адрес: ${NC}"
+      read certbot_email
+      
+      if [ -z "$certbot_email" ]; then
+        echo -e "${RED}Email не может быть пустым!${NC}"
+        sleep 2
+        return 1
+      fi
+      
+      email_param="--email $certbot_email"
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}Выпуск SSL сертификата для домена $base_domain...${NC}"
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo ""
+    
+    # Запускаем certbot с параметрами (обычный HTTP challenge)
+    if [ "$certbot_registered" = false ]; then
+      certbot --nginx -d "$base_domain" --non-interactive --agree-tos --redirect $email_param
+    else
+      certbot --nginx -d "$base_domain"
+    fi
+    
+    if [ $? -eq 0 ]; then
+      echo ""
+      echo -e "${GREEN}${BOLD}SSL сертификат успешно выпущен и настроен!${NC}"
+      
+      # Настраиваем автообновление через systemd timer (если еще не настроено)
+      echo -e "${YELLOW}Проверка настроек автообновления certbot...${NC}"
+      
+      # Проверяем наличие systemd таймера для certbot
+      if systemctl list-timers | grep -q "certbot.timer"; then
+        echo -e "${GREEN}Автообновление certbot уже настроено через systemd timer.${NC}"
+      else
+        echo -e "${YELLOW}Настройка автообновления certbot...${NC}"
+        systemctl enable certbot.timer 2>/dev/null
+        systemctl start certbot.timer 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+          echo -e "${GREEN}Автообновление certbot настроено.${NC}"
+        else
+          echo -e "${YELLOW}Не удалось настроить systemd timer.${NC}"
+          echo -e "${YELLOW}Рекомендуется настроить cron для автообновления:${NC}"
+          echo -e "${CYAN}0 0,12 * * * certbot renew --quiet${NC}"
+        fi
+      fi
+      
+      # Проверяем конфигурацию nginx после изменений certbot
+      echo -e "${YELLOW}Проверка конфигурации nginx...${NC}"
+      nginx -t
+      
+      if [ $? -eq 0 ]; then
+        echo -e "${YELLOW}Перезагрузка nginx...${NC}"
+        systemctl reload nginx
+        echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
+      fi
+    else
+      echo ""
+      echo -e "${RED}Ошибка при выпуске SSL сертификата.${NC}"
+      echo -e "${YELLOW}Проверьте, что:${NC}"
+      echo -e "${YELLOW}  1. Домен $base_domain указывает на IP этого сервера${NC}"
+      echo -e "${YELLOW}  2. Порты 80 и 443 открыты в firewall${NC}"
+      echo -e "${YELLOW}  3. Nginx работает корректно${NC}"
+      echo -e "${YELLOW}  4. Конфигурация nginx активирована${NC}"
+    fi
   fi
   
   sleep 5
@@ -1343,7 +1647,12 @@ create_nginx_config() {
   # Запрашиваем домен
   echo -e "${YELLOW}Введите данные для конфигурации nginx:${NC}"
   echo ""
-  echo -n -e "${GREEN}Введите домен (например, example.com или subdomain.example.com): ${NC}"
+  echo -e "${CYAN}Поддерживаются следующие форматы:${NC}"
+  echo -e "${CYAN}  - Обычный домен: example.com${NC}"
+  echo -e "${CYAN}  - Поддомен: subdomain.example.com${NC}"
+  echo -e "${CYAN}  - Wildcard домен: *.example.com${NC}"
+  echo ""
+  echo -n -e "${GREEN}Введите домен: ${NC}"
   read domain
   
   # Проверяем корректность домена
@@ -1353,19 +1662,89 @@ create_nginx_config() {
     return 1
   fi
   
-  # Запрашиваем порт
-  echo -n -e "${GREEN}Введите порт для проксирования (например, 8000): ${NC}"
-  read port
+  # Определяем тип домена (wildcard или обычный)
+  local is_wildcard=false
+  local base_domain="$domain"
+  local server_name_line="$domain"
   
-  # Проверяем корректность порта
-  if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-    echo -e "${RED}Некорректный порт! Укажите число от 1 до 65535.${NC}"
-    sleep 2
-    return 1
+  if [[ "$domain" == *"*"* ]]; then
+    is_wildcard=true
+    # Извлекаем базовый домен из wildcard (*.example.com -> example.com)
+    base_domain=$(echo "$domain" | sed 's/^\*\.//')
+    # Для wildcard добавляем и основной домен тоже
+    server_name_line="*.${base_domain} ${base_domain}"
+    echo -e "${GREEN}Обнаружен wildcard домен: ${BOLD}$domain${NC}"
+    echo -e "${YELLOW}Будет обрабатываться домен ${base_domain} и все его поддомены.${NC}"
   fi
   
-  # Формируем имя файла конфигурации
-  local config_filename="${domain}.conf"
+  # Выбор типа проксирования
+  echo ""
+  echo -e "${YELLOW}Выберите тип проксирования:${NC}"
+  echo -e "${CYAN}1.${NC} Локальный сервер (localhost:port)"
+  echo -e "${CYAN}2.${NC} Внешний сервер (host:port или IP:port)"
+  echo ""
+  echo -n -e "${GREEN}Ваш выбор (1-2): ${NC}"
+  read proxy_type
+  
+  local proxy_target=""
+  local proxy_host=""
+  local proxy_port=""
+  
+  if [ "$proxy_type" == "2" ]; then
+    # Внешний сервер
+    echo ""
+    echo -e "${YELLOW}Введите адрес внешнего сервера:${NC}"
+    echo -e "${CYAN}Формат: host:port или IP:port (например, example.com:8080 или 192.168.1.1:8080)${NC}"
+    echo -n -e "${GREEN}Адрес: ${NC}"
+    read proxy_target
+    
+    if [ -z "$proxy_target" ]; then
+      echo -e "${RED}Адрес не может быть пустым!${NC}"
+      sleep 2
+      return 1
+    fi
+    
+    # Проверяем формат адреса
+    if ! [[ "$proxy_target" =~ ^[^:]+:[0-9]+$ ]]; then
+      echo -e "${RED}Некорректный формат адреса! Используйте формат host:port или IP:port${NC}"
+      sleep 2
+      return 1
+    fi
+    
+    # Разделяем на host и port
+    proxy_host=$(echo "$proxy_target" | cut -d: -f1)
+    proxy_port=$(echo "$proxy_target" | cut -d: -f2)
+    
+    # Проверяем корректность порта
+    if ! [[ "$proxy_port" =~ ^[0-9]+$ ]] || [ "$proxy_port" -lt 1 ] || [ "$proxy_port" -gt 65535 ]; then
+      echo -e "${RED}Некорректный порт! Укажите число от 1 до 65535.${NC}"
+      sleep 2
+      return 1
+    fi
+    
+    proxy_target="https://${proxy_target}"
+  else
+    # Локальный сервер (по умолчанию)
+    if [ "$proxy_type" != "1" ]; then
+      echo -e "${YELLOW}Используется локальный сервер по умолчанию.${NC}"
+    fi
+    
+    echo ""
+    echo -n -e "${GREEN}Введите порт для проксирования (например, 8000): ${NC}"
+    read proxy_port
+    
+    # Проверяем корректность порта
+    if ! [[ "$proxy_port" =~ ^[0-9]+$ ]] || [ "$proxy_port" -lt 1 ] || [ "$proxy_port" -gt 65535 ]; then
+      echo -e "${RED}Некорректный порт! Укажите число от 1 до 65535.${NC}"
+      sleep 2
+      return 1
+    fi
+    
+    proxy_target="http://127.0.0.1:${proxy_port}"
+  fi
+  
+  # Формируем имя файла конфигурации (используем базовый домен для wildcard)
+  local config_filename="${base_domain}.conf"
   local config_path="/etc/nginx/sites-available/${config_filename}"
   
   # Проверяем, существует ли уже такой конфиг
@@ -1389,10 +1768,10 @@ create_nginx_config() {
 server {
     listen 80;
     listen [::]:80;
-    server_name ${domain};
+    server_name ${server_name_line};
 
     location / {
-        proxy_pass http://127.0.0.1:${port};
+        proxy_pass ${proxy_target};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -1457,89 +1836,24 @@ EOF
   echo ""
   
   # Спрашиваем про SSL сертификат
-  echo -n -e "${GREEN}Хотите выпустить SSL сертификат для домена $domain? (y/n): ${NC}"
+  local display_domain="$domain"
+  if [ "$is_wildcard" = true ]; then
+    display_domain="*.${base_domain} и ${base_domain}"
+  fi
+  
+  echo -n -e "${GREEN}Хотите выпустить SSL сертификат для домена ${display_domain}? (y/n): ${NC}"
   read issue_ssl
   
   if [[ "$issue_ssl" == "y" || "$issue_ssl" == "Y" ]]; then
-    # Проверяем наличие certbot
-    if ! command -v certbot &> /dev/null; then
-      echo -e "${RED}Certbot не установлен в системе.${NC}"
-      echo -e "${YELLOW}Установите certbot для выпуска SSL сертификатов.${NC}"
-      echo -e "${YELLOW}Например: sudo apt install certbot python3-certbot-nginx${NC}"
-      sleep 3
-      return 0
-    fi
-    
-    # Проверяем наличие зарегистрированного аккаунта certbot
-    local certbot_registered=false
-    if [ -d "/etc/letsencrypt/accounts" ] && [ -n "$(ls -A /etc/letsencrypt/accounts 2>/dev/null)" ]; then
-      certbot_registered=true
-    fi
-    
-    # Если аккаунт не зарегистрирован, запрашиваем email
-    local email_param=""
-    if [ "$certbot_registered" = false ]; then
-      echo -e "${YELLOW}Для выпуска SSL сертификата требуется email адрес.${NC}"
-      echo -e "${YELLOW}Он будет использован для уведомлений об истечении сертификата.${NC}"
-      echo ""
-      echo -n -e "${GREEN}Введите email адрес: ${NC}"
-      read certbot_email
-      
-      if [ -z "$certbot_email" ]; then
-        echo -e "${RED}Email не может быть пустым!${NC}"
-        sleep 2
-        return 0
-      fi
-      
-      email_param="--email $certbot_email"
-    fi
-    
-    echo ""
-    echo -e "${YELLOW}Выпуск SSL сертификата для домена $domain...${NC}"
-    echo -e "${YELLOW}---------------------------------------------${NC}"
-    echo ""
-    
-    # Запускаем certbot с параметрами
-    if [ "$certbot_registered" = false ]; then
-      certbot --nginx -d "$domain" --non-interactive --agree-tos --redirect $email_param
-    else
-      certbot --nginx -d "$domain"
-    fi
-    
-    if [ $? -eq 0 ]; then
-      echo ""
-      echo -e "${GREEN}${BOLD}SSL сертификат успешно выпущен и настроен!${NC}"
-      
-      # Настраиваем автообновление через systemd timer
-      echo -e "${YELLOW}Проверка настроек автообновления certbot...${NC}"
-      
-      if systemctl list-timers | grep -q "certbot.timer"; then
-        echo -e "${GREEN}Автообновление certbot уже настроено через systemd timer.${NC}"
-      else
-        echo -e "${YELLOW}Настройка автообновления certbot...${NC}"
-        systemctl enable certbot.timer 2>/dev/null
-        systemctl start certbot.timer 2>/dev/null
-        
-        if [ $? -eq 0 ]; then
-          echo -e "${GREEN}Автообновление certbot настроено через systemd timer.${NC}"
-        else
-          echo -e "${YELLOW}Не удалось настроить systemd timer.${NC}"
-          echo -e "${YELLOW}Рекомендуется настроить cron для автообновления:${NC}"
-          echo -e "${CYAN}0 0,12 * * * certbot renew --quiet${NC}"
-        fi
-      fi
-    else
-      echo ""
-      echo -e "${RED}Ошибка при выпуске SSL сертификата.${NC}"
-      echo -e "${YELLOW}Проверьте, что:${NC}"
-      echo -e "${YELLOW}  1. Домен $domain указывает на IP этого сервера${NC}"
-      echo -e "${YELLOW}  2. Порты 80 и 443 открыты в firewall${NC}"
-      echo -e "${YELLOW}  3. Nginx работает корректно${NC}"
-    fi
+    # Используем функцию issue_ssl_certificate для выпуска сертификата
+    issue_ssl_certificate "$config_filename"
   else
     echo -e "${YELLOW}Выпуск SSL сертификата пропущен.${NC}"
-    echo -e "${YELLOW}Вы можете выпустить сертификат позже командой:${NC}"
-    echo -e "${CYAN}sudo certbot --nginx -d $domain${NC}"
+    if [ "$is_wildcard" = true ]; then
+      echo -e "${YELLOW}Для wildcard домена используйте функцию выпуска wildcard сертификата в меню управления конфигурациями.${NC}"
+    else
+      echo -e "${YELLOW}Вы можете выпустить сертификат позже через меню управления конфигурациями nginx.${NC}"
+    fi
   fi
   
   echo ""
