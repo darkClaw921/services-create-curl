@@ -1725,9 +1725,61 @@ create_nginx_config() {
     # Проверяем наличие PHP
     if ! command -v php &> /dev/null; then
       echo -e "${RED}PHP не установлен в системе.${NC}"
-      echo -e "${YELLOW}Установите PHP для использования этого режима.${NC}"
-      sleep 3
-      return 1
+      echo ""
+      echo -e "${YELLOW}Хотите установить PHP и PHP-FPM?${NC}"
+      echo -n -e "${GREEN}Установить PHP 8.1 и PHP-FPM? (y/n): ${NC}"
+      read install_php
+
+      if [[ "$install_php" == "y" || "$install_php" == "Y" ]]; then
+        echo ""
+
+        # Проверяем, что это Ubuntu/Debian
+        if ! command -v apt-get &> /dev/null; then
+          echo -e "${RED}Автоматическая установка поддерживается только для Ubuntu/Debian.${NC}"
+          echo -e "${YELLOW}Установите PHP вручную для вашей системы.${NC}"
+          sleep 3
+          return 1
+        fi
+
+        echo -e "${YELLOW}Установка PHP 8.1 и PHP-FPM...${NC}"
+        echo -e "${CYAN}Это может занять несколько минут.${NC}"
+        echo ""
+
+        # Обновляем список пакетов
+        apt-get update
+
+        # Устанавливаем PHP и необходимые расширения
+        apt-get install -y php8.1 php8.1-fpm php8.1-cli php8.1-common php8.1-mysql php8.1-zip php8.1-gd php8.1-mbstring php8.1-curl php8.1-xml php8.1-bcmath
+
+        if [ $? -eq 0 ]; then
+          echo ""
+          echo -e "${GREEN}PHP и PHP-FPM успешно установлены!${NC}"
+
+          # Запускаем и активируем PHP-FPM
+          systemctl start php8.1-fpm
+          systemctl enable php8.1-fpm
+
+          echo -e "${GREEN}PHP-FPM запущен и добавлен в автозагрузку.${NC}"
+          echo ""
+
+          # Показываем версию PHP
+          php_version=$(php -v | head -1)
+          echo -e "${CYAN}Установленная версия: ${BOLD}$php_version${NC}"
+          sleep 2
+        else
+          echo ""
+          echo -e "${RED}Ошибка при установке PHP!${NC}"
+          echo -e "${YELLOW}Попробуйте установить вручную:${NC}"
+          echo -e "${CYAN}sudo apt-get update${NC}"
+          echo -e "${CYAN}sudo apt-get install php8.1 php8.1-fpm${NC}"
+          sleep 3
+          return 1
+        fi
+      else
+        echo -e "${YELLOW}Установка отменена.${NC}"
+        sleep 2
+        return 1
+      fi
     fi
 
     echo ""
@@ -1801,15 +1853,88 @@ PHPEOF
 
     if [ -z "$php_fpm_socket" ]; then
       echo -e "${RED}Не удалось найти сокет PHP-FPM.${NC}"
-      echo -e "${YELLOW}Убедитесь, что PHP-FPM установлен и запущен.${NC}"
       echo ""
-      echo -n -e "${GREEN}Введите путь к сокету PHP-FPM вручную (или Enter для использования 127.0.0.1:9000): ${NC}"
-      read manual_socket
+      echo -e "${YELLOW}Хотите установить PHP-FPM?${NC}"
+      echo -n -e "${GREEN}Установить PHP-FPM? (y/n): ${NC}"
+      read install_fpm
 
-      if [ -z "$manual_socket" ]; then
-        php_fpm_socket="127.0.0.1:9000"
+      if [[ "$install_fpm" == "y" || "$install_fpm" == "Y" ]]; then
+        echo ""
+
+        # Проверяем, что это Ubuntu/Debian
+        if ! command -v apt-get &> /dev/null; then
+          echo -e "${RED}Автоматическая установка поддерживается только для Ubuntu/Debian.${NC}"
+          echo -e "${YELLOW}Установите PHP-FPM вручную для вашей системы.${NC}"
+          sleep 3
+          return 1
+        fi
+
+        echo -e "${YELLOW}Определение версии PHP...${NC}"
+
+        # Определяем версию PHP
+        php_version=$(php -v 2>/dev/null | head -1 | grep -oP 'PHP \K[0-9]+\.[0-9]+' | head -1)
+
+        if [ -z "$php_version" ]; then
+          # Если не удалось определить, используем 8.1 по умолчанию
+          php_version="8.1"
+          echo -e "${YELLOW}Не удалось определить версию PHP. Используем версию 8.1 по умолчанию.${NC}"
+        else
+          echo -e "${GREEN}Обнаружена версия PHP: ${BOLD}$php_version${NC}"
+        fi
+
+        echo -e "${YELLOW}Установка PHP-FPM ${php_version}...${NC}"
+
+        # Обновляем список пакетов
+        apt-get update
+
+        # Устанавливаем PHP-FPM
+        apt-get install -y php${php_version}-fpm
+
+        if [ $? -eq 0 ]; then
+          echo ""
+          echo -e "${GREEN}PHP-FPM ${php_version} успешно установлен!${NC}"
+
+          # Запускаем и активируем PHP-FPM
+          systemctl start php${php_version}-fpm
+          systemctl enable php${php_version}-fpm
+
+          echo -e "${GREEN}PHP-FPM запущен и добавлен в автозагрузку.${NC}"
+
+          # Пытаемся найти сокет снова
+          sleep 2
+          if [ -S "/run/php/php${php_version}-fpm.sock" ]; then
+            php_fpm_socket="/run/php/php${php_version}-fpm.sock"
+          elif [ -S "/var/run/php/php${php_version}-fpm.sock" ]; then
+            php_fpm_socket="/var/run/php/php${php_version}-fpm.sock"
+          else
+            # Ищем любой сокет
+            php_fpm_socket=$(find /var/run /run -name "php*fpm*.sock" 2>/dev/null | head -1)
+          fi
+
+          if [ -z "$php_fpm_socket" ]; then
+            echo -e "${YELLOW}Сокет не найден. Используем TCP соединение: 127.0.0.1:9000${NC}"
+            php_fpm_socket="127.0.0.1:9000"
+          else
+            echo -e "${GREEN}Найден сокет: ${BOLD}$php_fpm_socket${NC}"
+          fi
+        else
+          echo ""
+          echo -e "${RED}Ошибка при установке PHP-FPM!${NC}"
+          echo -e "${YELLOW}Попробуйте установить вручную:${NC}"
+          echo -e "${CYAN}sudo apt-get install php${php_version}-fpm${NC}"
+          sleep 3
+          return 1
+        fi
       else
-        php_fpm_socket="$manual_socket"
+        echo ""
+        echo -n -e "${GREEN}Введите путь к сокету PHP-FPM вручную (или Enter для использования 127.0.0.1:9000): ${NC}"
+        read manual_socket
+
+        if [ -z "$manual_socket" ]; then
+          php_fpm_socket="127.0.0.1:9000"
+        else
+          php_fpm_socket="$manual_socket"
+        fi
       fi
     fi
 
