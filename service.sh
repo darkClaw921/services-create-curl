@@ -1907,9 +1907,9 @@ PHPEOF
   # Формируем блок location с учетом типа конфигурации
   if [ "$is_php_mode" = true ]; then
     # Проверяем наличие snippets/fastcgi-php.conf
-    local fastcgi_include=""
+    local has_fastcgi_snippet=false
     if [ -f "/etc/nginx/snippets/fastcgi-php.conf" ]; then
-      fastcgi_include="include snippets/fastcgi-php.conf;"
+      has_fastcgi_snippet=true
     fi
 
     # Определяем формат fastcgi_pass (unix socket или tcp)
@@ -1923,7 +1923,9 @@ PHPEOF
     fi
 
     # Конфигурация для PHP файлов
-    cat > "$config_path" << EOF
+    if [ "$has_fastcgi_snippet" = true ]; then
+      # Используем стандартный snippet
+      cat > "$config_path" << EOF
 server {
     listen 80;
     listen [::]:80;
@@ -1937,7 +1939,31 @@ server {
     }
 
     location ~ \.php$ {
-        ${fastcgi_include}
+        include snippets/fastcgi-php.conf;
+        ${fastcgi_pass_line}
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+    else
+      # Без snippet - пишем все директивы вручную
+      cat > "$config_path" << EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${server_name_line};
+
+    root ${php_root};
+    index index.php index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ \.php$ {
         ${fastcgi_pass_line}
         fastcgi_index index.php;
         fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
@@ -1949,6 +1975,7 @@ server {
     }
 }
 EOF
+    fi
   elif [ "$websocket_support" = true ]; then
     # Конфигурация с поддержкой WebSocket
     cat > "$config_path" << EOF
