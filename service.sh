@@ -1220,6 +1220,12 @@ issue_wildcard_certificate() {
     # Извлекаем proxy_pass из текущей конфигурации
     local proxy_pass_value=$(grep -E "^\s*proxy_pass" "$config_path" | sed 's/^\s*proxy_pass\s*//' | sed 's/;//' | head -1)
     
+    # Проверяем, есть ли уже поддержка WebSocket в текущей конфигурации
+    local has_websocket=false
+    if grep -q "proxy_http_version 1.1" "$config_path" && grep -q "Upgrade" "$config_path" && grep -q "Connection.*upgrade" "$config_path"; then
+      has_websocket=true
+    fi
+    
     # Проверяем, есть ли уже ssl_session_cache в основной конфигурации nginx
     local has_ssl_cache=false
     if grep -q "ssl_session_cache" /etc/nginx/nginx.conf 2>/dev/null; then
@@ -1258,7 +1264,25 @@ EOF
 EOF
     fi
     
-    cat >> "$temp_config" << EOF
+    # Добавляем блок location с учетом поддержки WebSocket
+    if [ "$has_websocket" = true ]; then
+      cat >> "$temp_config" << EOF
+    ssl_session_timeout 10m;
+    
+    location / {
+        proxy_pass ${proxy_pass_value};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+    else
+      cat >> "$temp_config" << EOF
     ssl_session_timeout 10m;
     
     location / {
@@ -1270,6 +1294,7 @@ EOF
     }
 }
 EOF
+    fi
     
     # Заменяем конфигурацию
     mv "$temp_config" "$config_path"
@@ -1743,6 +1768,18 @@ create_nginx_config() {
     proxy_target="http://127.0.0.1:${proxy_port}"
   fi
   
+  # Спрашиваем про поддержку WebSocket
+  echo ""
+  echo -e "${YELLOW}Нужна ли поддержка WebSocket проксирования?${NC}"
+  echo -n -e "${GREEN}Включить поддержку WebSocket? (y/n): ${NC}"
+  read enable_websocket
+  
+  local websocket_support=false
+  if [[ "$enable_websocket" == "y" || "$enable_websocket" == "Y" ]]; then
+    websocket_support=true
+    echo -e "${GREEN}Поддержка WebSocket будет включена.${NC}"
+  fi
+  
   # Формируем имя файла конфигурации (используем базовый домен для wildcard)
   local config_filename="${base_domain}.conf"
   local config_path="/etc/nginx/sites-available/${config_filename}"
@@ -1764,7 +1801,28 @@ create_nginx_config() {
   echo ""
   echo -e "${YELLOW}Создание конфигурационного файла...${NC}"
   
-  cat > "$config_path" << EOF
+  # Формируем блок location с учетом поддержки WebSocket
+  if [ "$websocket_support" = true ]; then
+    cat > "$config_path" << EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${server_name_line};
+
+    location / {
+        proxy_pass ${proxy_target};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+  else
+    cat > "$config_path" << EOF
 server {
     listen 80;
     listen [::]:80;
@@ -1779,6 +1837,7 @@ server {
     }
 }
 EOF
+  fi
   
   if [ $? -eq 0 ]; then
     echo -e "${GREEN}Конфигурационный файл создан: ${BOLD}$config_path${NC}"
