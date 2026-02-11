@@ -1707,15 +1707,116 @@ create_nginx_config() {
   echo -e "${YELLOW}Выберите тип проксирования:${NC}"
   echo -e "${CYAN}1.${NC} Локальный сервер (localhost:port)"
   echo -e "${CYAN}2.${NC} Внешний сервер (host:port или IP:port)"
+  echo -e "${CYAN}3.${NC} PHP файлы (через PHP-FPM)"
   echo ""
-  echo -n -e "${GREEN}Ваш выбор (1-2): ${NC}"
+  echo -n -e "${GREEN}Ваш выбор (1-3): ${NC}"
   read proxy_type
-  
+
   local proxy_target=""
   local proxy_host=""
   local proxy_port=""
-  
-  if [ "$proxy_type" == "2" ]; then
+  local php_root=""
+  local is_php_mode=false
+
+  if [ "$proxy_type" == "3" ]; then
+    # PHP файлы через PHP-FPM
+    is_php_mode=true
+
+    # Проверяем наличие PHP
+    if ! command -v php &> /dev/null; then
+      echo -e "${RED}PHP не установлен в системе.${NC}"
+      echo -e "${YELLOW}Установите PHP для использования этого режима.${NC}"
+      sleep 3
+      return 1
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Введите путь к директории с PHP файлами:${NC}"
+    echo -e "${CYAN}Например: /var/www/mysite${NC}"
+    echo -n -e "${GREEN}Путь: ${NC}"
+    read php_root
+
+    # Проверяем корректность пути
+    if [ -z "$php_root" ]; then
+      echo -e "${RED}Путь не может быть пустым!${NC}"
+      sleep 2
+      return 1
+    fi
+
+    # Удаляем конечный слеш если есть
+    php_root="${php_root%/}"
+
+    # Проверяем существование директории
+    if [ ! -d "$php_root" ]; then
+      echo -e "${YELLOW}Директория $php_root не существует.${NC}"
+      echo -n -e "${GREEN}Создать директорию? (y/n): ${NC}"
+      read create_dir
+
+      if [[ "$create_dir" == "y" || "$create_dir" == "Y" ]]; then
+        mkdir -p "$php_root"
+        if [ $? -eq 0 ]; then
+          echo -e "${GREEN}Директория создана: $php_root${NC}"
+
+          # Создаем тестовый index.php
+          cat > "$php_root/index.php" << 'PHPEOF'
+<?php
+phpinfo();
+?>
+PHPEOF
+          echo -e "${GREEN}Создан тестовый файл: $php_root/index.php${NC}"
+        else
+          echo -e "${RED}Ошибка при создании директории!${NC}"
+          sleep 2
+          return 1
+        fi
+      else
+        echo -e "${YELLOW}Создание конфигурации отменено.${NC}"
+        sleep 2
+        return 1
+      fi
+    fi
+
+    # Определяем сокет PHP-FPM
+    local php_fpm_socket=""
+
+    # Проверяем различные варианты сокетов PHP-FPM
+    if [ -S "/run/php/php-fpm.sock" ]; then
+      php_fpm_socket="/run/php/php-fpm.sock"
+    elif [ -S "/var/run/php-fpm/php-fpm.sock" ]; then
+      php_fpm_socket="/var/run/php-fpm/php-fpm.sock"
+    elif [ -S "/var/run/php/php7.4-fpm.sock" ]; then
+      php_fpm_socket="/var/run/php/php7.4-fpm.sock"
+    elif [ -S "/var/run/php/php8.0-fpm.sock" ]; then
+      php_fpm_socket="/var/run/php/php8.0-fpm.sock"
+    elif [ -S "/var/run/php/php8.1-fpm.sock" ]; then
+      php_fpm_socket="/var/run/php/php8.1-fpm.sock"
+    elif [ -S "/var/run/php/php8.2-fpm.sock" ]; then
+      php_fpm_socket="/var/run/php/php8.2-fpm.sock"
+    elif [ -S "/var/run/php/php8.3-fpm.sock" ]; then
+      php_fpm_socket="/var/run/php/php8.3-fpm.sock"
+    else
+      # Пытаемся найти любой сокет PHP-FPM
+      php_fpm_socket=$(find /var/run /run -name "php*fpm*.sock" 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$php_fpm_socket" ]; then
+      echo -e "${RED}Не удалось найти сокет PHP-FPM.${NC}"
+      echo -e "${YELLOW}Убедитесь, что PHP-FPM установлен и запущен.${NC}"
+      echo ""
+      echo -n -e "${GREEN}Введите путь к сокету PHP-FPM вручную (или Enter для использования 127.0.0.1:9000): ${NC}"
+      read manual_socket
+
+      if [ -z "$manual_socket" ]; then
+        php_fpm_socket="127.0.0.1:9000"
+      else
+        php_fpm_socket="$manual_socket"
+      fi
+    fi
+
+    echo -e "${GREEN}Используется PHP-FPM сокет: ${BOLD}$php_fpm_socket${NC}"
+    echo -e "${GREEN}Корневая директория: ${BOLD}$php_root${NC}"
+
+  elif [ "$proxy_type" == "2" ]; then
     # Внешний сервер
     echo ""
     echo -e "${YELLOW}Введите адрес внешнего сервера:${NC}"
@@ -1768,16 +1869,18 @@ create_nginx_config() {
     proxy_target="http://127.0.0.1:${proxy_port}"
   fi
   
-  # Спрашиваем про поддержку WebSocket
-  echo ""
-  echo -e "${YELLOW}Нужна ли поддержка WebSocket проксирования?${NC}"
-  echo -n -e "${GREEN}Включить поддержку WebSocket? (y/n): ${NC}"
-  read enable_websocket
-  
+  # Спрашиваем про поддержку WebSocket (только если не PHP режим)
   local websocket_support=false
-  if [[ "$enable_websocket" == "y" || "$enable_websocket" == "Y" ]]; then
-    websocket_support=true
-    echo -e "${GREEN}Поддержка WebSocket будет включена.${NC}"
+  if [ "$is_php_mode" = false ]; then
+    echo ""
+    echo -e "${YELLOW}Нужна ли поддержка WebSocket проксирования?${NC}"
+    echo -n -e "${GREEN}Включить поддержку WebSocket? (y/n): ${NC}"
+    read enable_websocket
+
+    if [[ "$enable_websocket" == "y" || "$enable_websocket" == "Y" ]]; then
+      websocket_support=true
+      echo -e "${GREEN}Поддержка WebSocket будет включена.${NC}"
+    fi
   fi
   
   # Формируем имя файла конфигурации (используем базовый домен для wildcard)
@@ -1800,9 +1903,54 @@ create_nginx_config() {
   # Создаем конфигурационный файл
   echo ""
   echo -e "${YELLOW}Создание конфигурационного файла...${NC}"
-  
-  # Формируем блок location с учетом поддержки WebSocket
-  if [ "$websocket_support" = true ]; then
+
+  # Формируем блок location с учетом типа конфигурации
+  if [ "$is_php_mode" = true ]; then
+    # Проверяем наличие snippets/fastcgi-php.conf
+    local fastcgi_include=""
+    if [ -f "/etc/nginx/snippets/fastcgi-php.conf" ]; then
+      fastcgi_include="include snippets/fastcgi-php.conf;"
+    fi
+
+    # Определяем формат fastcgi_pass (unix socket или tcp)
+    local fastcgi_pass_line=""
+    if [[ "$php_fpm_socket" == *":"* ]]; then
+      # TCP соединение (например, 127.0.0.1:9000)
+      fastcgi_pass_line="fastcgi_pass ${php_fpm_socket};"
+    else
+      # Unix socket
+      fastcgi_pass_line="fastcgi_pass unix:${php_fpm_socket};"
+    fi
+
+    # Конфигурация для PHP файлов
+    cat > "$config_path" << EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${server_name_line};
+
+    root ${php_root};
+    index index.php index.html index.htm;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ \.php$ {
+        ${fastcgi_include}
+        ${fastcgi_pass_line}
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+  elif [ "$websocket_support" = true ]; then
+    # Конфигурация с поддержкой WebSocket
     cat > "$config_path" << EOF
 server {
     listen 80;
@@ -1822,6 +1970,7 @@ server {
 }
 EOF
   else
+    # Обычная конфигурация для проксирования
     cat > "$config_path" << EOF
 server {
     listen 80;
