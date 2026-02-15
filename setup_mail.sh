@@ -716,6 +716,329 @@ SQL
   read
 }
 
+# Удаление домена или почтового ящика
+delete_domain_mailbox() {
+  clear_screen
+  echo -e "${BOLD}${RED}==============================================${NC}"
+  echo -e "${BOLD}${RED}     УДАЛЕНИЕ ДОМЕНА / ПОЧТОВОГО ЯЩИКА        ${NC}"
+  echo -e "${BOLD}${RED}==============================================${NC}"
+  echo ""
+
+  # Получаем данные БД
+  DB_NAME="mailserver"
+  DB_USER="mailuser"
+  DB_PASS=$(grep "^password" /etc/postfix/mysql-virtual-mailbox-domains.cf 2>/dev/null | awk -F' = ' '{print $2}' | tr -d ' ' || echo "")
+
+  if [ -z "$DB_PASS" ]; then
+    echo -e "${RED}Не удалось определить пароль БД. Убедитесь, что почтовый сервер установлен.${NC}"
+    sleep 2
+    return 1
+  fi
+
+  # Проверяем подключение к БД
+  if ! MYSQL_PWD="$DB_PASS" mysql -u "$DB_USER" "$DB_NAME" -e "SELECT 1;" >/dev/null 2>&1; then
+    echo -e "${RED}Ошибка подключения к базе данных.${NC}"
+    sleep 2
+    return 1
+  fi
+
+  echo -e "${YELLOW}Выберите действие:${NC}"
+  echo -e "${CYAN}1.${NC} Удалить домен (со всеми почтовыми ящиками)"
+  echo -e "${CYAN}2.${NC} Удалить почтовый ящик"
+  echo -e "${CYAN}3.${NC} Вернуться в главное меню"
+  echo ""
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo -n -e "${GREEN}Ваш выбор (1-3): ${NC}"
+  read choice
+
+  case $choice in
+    1)
+      delete_domain "$DB_PASS" "$DB_USER" "$DB_NAME"
+      ;;
+    2)
+      delete_mailbox "$DB_PASS" "$DB_USER" "$DB_NAME"
+      ;;
+    3)
+      return 0
+      ;;
+    *)
+      echo -e "${RED}Некорректный выбор!${NC}"
+      sleep 1
+      ;;
+  esac
+}
+
+# Удаление домена со всеми почтовыми ящиками
+delete_domain() {
+  local db_pass="$1"
+  local db_user="$2"
+  local db_name="$3"
+
+  clear_screen
+  echo -e "${BOLD}${RED}==============================================${NC}"
+  echo -e "${BOLD}${RED}     УДАЛЕНИЕ ДОМЕНА                          ${NC}"
+  echo -e "${BOLD}${RED}==============================================${NC}"
+  echo ""
+
+  # Получаем список доменов
+  local domains_output=$(MYSQL_PWD="$db_pass" mysql -u "$db_user" "$db_name" -Nse "SELECT name FROM virtual_domains;" 2>/dev/null)
+
+  if [ -z "$domains_output" ]; then
+    echo -e "${YELLOW}Нет зарегистрированных доменов.${NC}"
+    echo ""
+    echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+    read
+    return 0
+  fi
+
+  local domains=()
+  readarray -t domains <<< "$domains_output"
+
+  echo -e "${YELLOW}Зарегистрированные домены:${NC}"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  for i in "${!domains[@]}"; do
+    # Считаем количество почтовых ящиков для домена
+    local mailbox_count=$(MYSQL_PWD="$db_pass" mysql -u "$db_user" "$db_name" -Nse "SELECT COUNT(*) FROM virtual_users WHERE domain_id=(SELECT id FROM virtual_domains WHERE name='${domains[$i]}' LIMIT 1);" 2>/dev/null || echo "0")
+    echo -e "${CYAN}$((i+1)).${NC} ${domains[$i]} ${YELLOW}(${mailbox_count} ящиков)${NC}"
+  done
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+
+  echo -n -e "${GREEN}Выберите номер домена для удаления (1-${#domains[@]}): ${NC}"
+  read domain_choice
+
+  if ! [[ "$domain_choice" =~ ^[0-9]+$ ]] || [ "$domain_choice" -lt 1 ] || [ "$domain_choice" -gt ${#domains[@]} ]; then
+    echo -e "${RED}Некорректный выбор!${NC}"
+    sleep 2
+    return 1
+  fi
+
+  local selected_domain="${domains[$((domain_choice-1))]}"
+
+  # Показываем что будет удалено
+  echo ""
+  echo -e "${RED}${BOLD}Будет удалено для домена ${selected_domain}:${NC}"
+
+  # Показываем почтовые ящики
+  local mailboxes_output=$(MYSQL_PWD="$db_pass" mysql -u "$db_user" "$db_name" -Nse "SELECT email FROM virtual_users WHERE domain_id=(SELECT id FROM virtual_domains WHERE name='$selected_domain' LIMIT 1);" 2>/dev/null)
+  if [ -n "$mailboxes_output" ]; then
+    echo -e "${YELLOW}Почтовые ящики:${NC}"
+    while IFS= read -r mb; do
+      echo -e "  ${RED}x${NC} $mb"
+    done <<< "$mailboxes_output"
+  fi
+  echo -e "${YELLOW}DKIM ключи:${NC} /etc/opendkim/keys/${selected_domain}/"
+  echo -e "${YELLOW}Почтовые данные:${NC} /var/mail/vhosts/${selected_domain}/"
+  echo -e "${YELLOW}Конфигурация OpenDKIM для домена${NC}"
+  echo ""
+
+  echo -e "${RED}${BOLD}Это действие НЕОБРАТИМО!${NC}"
+  echo ""
+  echo -n -e "${GREEN}Введите имя домена '${selected_domain}' для подтверждения удаления: ${NC}"
+  read confirmation
+
+  if [ "$confirmation" != "$selected_domain" ]; then
+    echo -e "${YELLOW}Удаление отменено.${NC}"
+    sleep 2
+    return 0
+  fi
+
+  echo ""
+  echo -e "${YELLOW}Удаление домена ${selected_domain}...${NC}"
+  echo ""
+
+  # Удаляем почтовые ящики и домен из БД (ON DELETE CASCADE удалит users)
+  MYSQL_PWD="$db_pass" mysql -u "$db_user" "$db_name" <<SQL 2>/dev/null
+DELETE FROM virtual_domains WHERE name='$selected_domain';
+SQL
+
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}Домен и почтовые ящики удалены из БД.${NC}"
+  else
+    echo -e "${RED}Ошибка при удалении из БД.${NC}"
+  fi
+
+  # Удаляем DKIM ключи
+  if [ -d "/etc/opendkim/keys/$selected_domain" ]; then
+    rm -rf "/etc/opendkim/keys/$selected_domain"
+    echo -e "${GREEN}DKIM ключи удалены.${NC}"
+  fi
+
+  # Удаляем записи из opendkim.conf
+  if [ -f "/etc/opendkim.conf" ]; then
+    # Удаляем блок конфигурации для этого домена
+    sed -i "/^Domain[[:space:]]*$selected_domain$/,/^Selector[[:space:]]/d" /etc/opendkim.conf 2>/dev/null || true
+    # На случай если блок не полностью удален, удаляем отдельные строки
+    sed -i "/^Domain[[:space:]]*$selected_domain$/d" /etc/opendkim.conf 2>/dev/null || true
+    sed -i "\|^KeyFile.*/etc/opendkim/keys/$selected_domain/|d" /etc/opendkim.conf 2>/dev/null || true
+    echo -e "${GREEN}Конфигурация OpenDKIM очищена.${NC}"
+  fi
+
+  # Удаляем почтовые данные
+  if [ -d "/var/mail/vhosts/$selected_domain" ]; then
+    rm -rf "/var/mail/vhosts/$selected_domain"
+    echo -e "${GREEN}Почтовые данные удалены.${NC}"
+  fi
+
+  # Удаляем из domains.list
+  if [ -f "$DOMAINS_LIST_FILE" ]; then
+    sed -i "/^${selected_domain}:/d" "$DOMAINS_LIST_FILE" 2>/dev/null || true
+    echo -e "${GREEN}Запись удалена из domains.list.${NC}"
+  fi
+
+  # Удаляем из mailboxes.list
+  if [ -f "$MAILBOXES_LIST_FILE" ]; then
+    sed -i "/:${selected_domain}:/d" "$MAILBOXES_LIST_FILE" 2>/dev/null || true
+    echo -e "${GREEN}Записи удалены из mailboxes.list.${NC}"
+  fi
+
+  # Перезапускаем сервисы
+  echo ""
+  echo -e "${YELLOW}Перезапуск сервисов...${NC}"
+  systemctl restart postfix dovecot opendkim 2>/dev/null || true
+  echo -e "${GREEN}Сервисы перезапущены.${NC}"
+
+  echo ""
+  echo -e "${GREEN}${BOLD}Домен ${selected_domain} успешно удален!${NC}"
+  echo ""
+  echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+  read
+}
+
+# Удаление отдельного почтового ящика
+delete_mailbox() {
+  local db_pass="$1"
+  local db_user="$2"
+  local db_name="$3"
+
+  clear_screen
+  echo -e "${BOLD}${RED}==============================================${NC}"
+  echo -e "${BOLD}${RED}     УДАЛЕНИЕ ПОЧТОВОГО ЯЩИКА                 ${NC}"
+  echo -e "${BOLD}${RED}==============================================${NC}"
+  echo ""
+
+  # Получаем список доменов
+  local domains_output=$(MYSQL_PWD="$db_pass" mysql -u "$db_user" "$db_name" -Nse "SELECT name FROM virtual_domains;" 2>/dev/null)
+
+  if [ -z "$domains_output" ]; then
+    echo -e "${YELLOW}Нет зарегистрированных доменов.${NC}"
+    echo ""
+    echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+    read
+    return 0
+  fi
+
+  local domains=()
+  readarray -t domains <<< "$domains_output"
+
+  echo -e "${YELLOW}Выберите домен:${NC}"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  for i in "${!domains[@]}"; do
+    echo -e "${CYAN}$((i+1)).${NC} ${domains[$i]}"
+  done
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+
+  echo -n -e "${GREEN}Номер домена (1-${#domains[@]}): ${NC}"
+  read domain_choice
+
+  if ! [[ "$domain_choice" =~ ^[0-9]+$ ]] || [ "$domain_choice" -lt 1 ] || [ "$domain_choice" -gt ${#domains[@]} ]; then
+    echo -e "${RED}Некорректный выбор!${NC}"
+    sleep 2
+    return 1
+  fi
+
+  local selected_domain="${domains[$((domain_choice-1))]}"
+
+  # Получаем список почтовых ящиков для этого домена
+  local mailboxes_output=$(MYSQL_PWD="$db_pass" mysql -u "$db_user" "$db_name" -Nse "SELECT email FROM virtual_users WHERE domain_id=(SELECT id FROM virtual_domains WHERE name='$selected_domain' LIMIT 1);" 2>/dev/null)
+
+  if [ -z "$mailboxes_output" ]; then
+    echo -e "${YELLOW}Нет почтовых ящиков для домена ${selected_domain}.${NC}"
+    echo ""
+    echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+    read
+    return 0
+  fi
+
+  local mailboxes=()
+  readarray -t mailboxes <<< "$mailboxes_output"
+
+  echo ""
+  echo -e "${YELLOW}Почтовые ящики домена ${BOLD}${selected_domain}${NC}${YELLOW}:${NC}"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  for i in "${!mailboxes[@]}"; do
+    echo -e "${CYAN}$((i+1)).${NC} ${mailboxes[$i]}"
+  done
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+
+  echo -n -e "${GREEN}Номер почтового ящика для удаления (1-${#mailboxes[@]}): ${NC}"
+  read mailbox_choice
+
+  if ! [[ "$mailbox_choice" =~ ^[0-9]+$ ]] || [ "$mailbox_choice" -lt 1 ] || [ "$mailbox_choice" -gt ${#mailboxes[@]} ]; then
+    echo -e "${RED}Некорректный выбор!${NC}"
+    sleep 2
+    return 1
+  fi
+
+  local selected_mailbox="${mailboxes[$((mailbox_choice-1))]}"
+  local mail_user=$(echo "$selected_mailbox" | cut -d@ -f1)
+
+  echo ""
+  echo -e "${RED}${BOLD}Будет удален почтовый ящик: ${selected_mailbox}${NC}"
+  echo -e "${YELLOW}Почтовые данные:${NC} /var/mail/vhosts/${selected_domain}/${mail_user}/"
+  echo ""
+
+  echo -n -e "${GREEN}Вы уверены? (y/n): ${NC}"
+  read confirmation
+
+  if [ "$confirmation" != "y" ] && [ "$confirmation" != "Y" ]; then
+    echo -e "${YELLOW}Удаление отменено.${NC}"
+    sleep 2
+    return 0
+  fi
+
+  echo ""
+  echo -e "${YELLOW}Удаление почтового ящика ${selected_mailbox}...${NC}"
+  echo ""
+
+  # Удаляем из БД
+  MYSQL_PWD="$db_pass" mysql -u "$db_user" "$db_name" <<SQL 2>/dev/null
+DELETE FROM virtual_users WHERE email='$selected_mailbox';
+SQL
+
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}Почтовый ящик удален из БД.${NC}"
+  else
+    echo -e "${RED}Ошибка при удалении из БД.${NC}"
+  fi
+
+  # Удаляем почтовые данные пользователя
+  if [ -d "/var/mail/vhosts/$selected_domain/$mail_user" ]; then
+    rm -rf "/var/mail/vhosts/$selected_domain/$mail_user"
+    echo -e "${GREEN}Почтовые данные удалены.${NC}"
+  fi
+
+  # Удаляем из mailboxes.list
+  if [ -f "$MAILBOXES_LIST_FILE" ]; then
+    sed -i "/^${selected_mailbox}:/d" "$MAILBOXES_LIST_FILE" 2>/dev/null || true
+    echo -e "${GREEN}Запись удалена из mailboxes.list.${NC}"
+  fi
+
+  # Перезапускаем dovecot
+  echo ""
+  echo -e "${YELLOW}Перезапуск Dovecot...${NC}"
+  systemctl restart dovecot 2>/dev/null || true
+  echo -e "${GREEN}Dovecot перезапущен.${NC}"
+
+  echo ""
+  echo -e "${GREEN}${BOLD}Почтовый ящик ${selected_mailbox} успешно удален!${NC}"
+  echo ""
+  echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+  read
+}
+
 # Исправление пароля БД
 fix_db_password() {
   clear_screen
@@ -1155,12 +1478,13 @@ show_domain_details() {
   echo ""
   echo -e "${YELLOW}Выберите действие:${NC}"
   echo -e "${CYAN}1.${NC} Отправить тестовое письмо"
-  echo -e "${CYAN}2.${NC} Вернуться к списку доменов"
+  echo -e "${CYAN}2.${NC} Диагностика домена (DNS, DKIM, SPF, блеклисты)"
+  echo -e "${CYAN}3.${NC} Вернуться к списку доменов"
   echo ""
   echo -e "${YELLOW}---------------------------------------------${NC}"
-  echo -n -e "${GREEN}Ваш выбор (1-2): ${NC}"
+  echo -n -e "${GREEN}Ваш выбор (1-3): ${NC}"
   read action_choice
-  
+
   case $action_choice in
     1)
       send_test_email "$domain" "$hostname_fqdn" "$server_ip"
@@ -1169,6 +1493,9 @@ show_domain_details() {
       read
       ;;
     2)
+      diagnose_domain "$domain"
+      ;;
+    3)
       return 0
       ;;
     *)
@@ -1878,6 +2205,693 @@ show_dns_records() {
   fi
   echo ""
   echo -e "${BOLD}${CYAN}=====================================================${NC}"
+}
+
+# Диагностика почтового домена
+diagnose_domain() {
+  set +e  # Отключаем выход при ошибке для диагностики
+  local domain="$1"
+
+  # Если домен не передан, предлагаем выбрать
+  if [ -z "$domain" ]; then
+    DB_NAME="mailserver"
+    DB_USER="mailuser"
+    DB_PASS=$(grep "^password" /etc/postfix/mysql-virtual-mailbox-domains.cf 2>/dev/null | awk -F' = ' '{print $2}' | tr -d ' ' || echo "")
+
+    if [ -z "$DB_PASS" ]; then
+      echo -e "${RED}Почтовый сервер не установлен.${NC}"
+      sleep 2
+      set -e; return 1
+    fi
+
+    local domains_output=$(MYSQL_PWD="$DB_PASS" mysql -u "$DB_USER" "$DB_NAME" -Nse "SELECT name FROM virtual_domains;" 2>/dev/null)
+    if [ -z "$domains_output" ]; then
+      echo -e "${YELLOW}Нет зарегистрированных доменов.${NC}"
+      sleep 2
+      set -e; return 0
+    fi
+
+    local domains=()
+    readarray -t domains <<< "$domains_output"
+
+    clear_screen
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo -e "${BOLD}${CYAN}     ДИАГНОСТИКА ПОЧТОВОГО ДОМЕНА             ${NC}"
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo ""
+    echo -e "${YELLOW}Выберите домен для диагностики:${NC}"
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    for i in "${!domains[@]}"; do
+      echo -e "${CYAN}$((i+1)).${NC} ${domains[$i]}"
+    done
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo ""
+    echo -n -e "${GREEN}Номер домена (1-${#domains[@]}): ${NC}"
+    read domain_choice
+
+    if ! [[ "$domain_choice" =~ ^[0-9]+$ ]] || [ "$domain_choice" -lt 1 ] || [ "$domain_choice" -gt ${#domains[@]} ]; then
+      echo -e "${RED}Некорректный выбор!${NC}"
+      sleep 2
+      set -e; return 1
+    fi
+
+    domain="${domains[$((domain_choice-1))]}"
+  fi
+
+  clear_screen
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo -e "${BOLD}${CYAN}  ДИАГНОСТИКА ДОМЕНА: ${domain}${NC}"
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+
+  local server_ip=$(hostname -I | awk '{print $1}')
+  local hostname_fqdn=""
+  if [ -f "$DOMAINS_LIST_FILE" ]; then
+    hostname_fqdn=$(grep "^${domain}:" "$DOMAINS_LIST_FILE" | head -1 | cut -d: -f2)
+  fi
+  if [ -z "$hostname_fqdn" ]; then
+    hostname_fqdn="mail.${domain}"
+  fi
+
+  local issues=0
+  local warnings=0
+
+  # Флаги для автоисправления
+  local fix_ptr=false
+  local fix_tls=false
+  local fix_spf_dup=false
+  local fix_services_postfix=false
+  local fix_services_dovecot=false
+  local fix_services_opendkim=false
+
+  # --- 1. PTR (rDNS) ---
+  echo -e "${BOLD}${YELLOW}[1/7] PTR-запись (rDNS) для IP ${server_ip}${NC}"
+  local ptr_record=""
+  if command -v dig >/dev/null 2>&1; then
+    ptr_record=$(dig +short -x "$server_ip" 2>/dev/null | sed 's/\.$//')
+  elif command -v host >/dev/null 2>&1; then
+    ptr_record=$(host "$server_ip" 2>/dev/null | grep "domain name pointer" | awk '{print $NF}' | sed 's/\.$//')
+  elif command -v nslookup >/dev/null 2>&1; then
+    ptr_record=$(nslookup "$server_ip" 2>/dev/null | grep "name = " | awk '{print $NF}' | sed 's/\.$//')
+  fi
+
+  if [ -z "$ptr_record" ]; then
+    echo -e "  ${RED}ОШИБКА: PTR-запись не найдена!${NC}"
+    echo -e "  ${YELLOW}Необходимо настроить rDNS у хостинг-провайдера: ${server_ip} -> ${hostname_fqdn}${NC}"
+    issues=$((issues+1))
+    fix_ptr=true
+  elif [ "$ptr_record" = "$hostname_fqdn" ]; then
+    echo -e "  ${GREEN}OK: ${ptr_record}${NC}"
+  else
+    echo -e "  ${RED}ОШИБКА: PTR указывает на '${ptr_record}', ожидается '${hostname_fqdn}'${NC}"
+    echo -e "  ${YELLOW}Измените rDNS у хостинг-провайдера на: ${hostname_fqdn}${NC}"
+    issues=$((issues+1))
+    fix_ptr=true
+  fi
+  echo ""
+
+  # --- 2. A-запись для mail.domain ---
+  echo -e "${BOLD}${YELLOW}[2/7] A-запись для ${hostname_fqdn}${NC}"
+  local a_record=""
+  if command -v dig >/dev/null 2>&1; then
+    a_record=$(dig +short A "$hostname_fqdn" 2>/dev/null | head -1)
+  elif command -v host >/dev/null 2>&1; then
+    a_record=$(host -t A "$hostname_fqdn" 2>/dev/null | grep "has address" | awk '{print $NF}' | head -1)
+  fi
+
+  if [ -z "$a_record" ]; then
+    echo -e "  ${RED}ОШИБКА: A-запись не найдена для ${hostname_fqdn}${NC}"
+    echo -e "  ${YELLOW}Добавьте A-запись: ${hostname_fqdn} -> ${server_ip}${NC}"
+    issues=$((issues+1))
+  elif [ "$a_record" = "$server_ip" ]; then
+    echo -e "  ${GREEN}OK: ${a_record}${NC}"
+  else
+    echo -e "  ${RED}ОШИБКА: A-запись указывает на ${a_record}, ожидается ${server_ip}${NC}"
+    issues=$((issues+1))
+  fi
+  echo ""
+
+  # --- 3. MX-запись ---
+  echo -e "${BOLD}${YELLOW}[3/7] MX-запись для ${domain}${NC}"
+  local mx_record=""
+  if command -v dig >/dev/null 2>&1; then
+    mx_record=$(dig +short MX "$domain" 2>/dev/null | head -1)
+  elif command -v host >/dev/null 2>&1; then
+    mx_record=$(host -t MX "$domain" 2>/dev/null | grep "mail is handled" | head -1 | awk '{print $NF}' | sed 's/\.$//')
+  fi
+
+  if [ -z "$mx_record" ]; then
+    echo -e "  ${RED}ОШИБКА: MX-запись не найдена!${NC}"
+    echo -e "  ${YELLOW}Добавьте MX-запись: ${domain} -> ${hostname_fqdn} (приоритет 10)${NC}"
+    issues=$((issues+1))
+  else
+    echo -e "  ${GREEN}OK: ${mx_record}${NC}"
+  fi
+  echo ""
+
+  # --- 4. SPF ---
+  echo -e "${BOLD}${YELLOW}[4/7] SPF-запись для ${domain}${NC}"
+  local spf_record=""
+  local spf_count=0
+  if command -v dig >/dev/null 2>&1; then
+    spf_record=$(dig +short TXT "$domain" 2>/dev/null | grep -i "v=spf1" | tr -d '"')
+    spf_count=$(dig +short TXT "$domain" 2>/dev/null | grep -ci "v=spf1")
+  elif command -v host >/dev/null 2>&1; then
+    spf_record=$(host -t TXT "$domain" 2>/dev/null | grep -i "v=spf1" | sed 's/.*"\(.*\)"/\1/')
+    spf_count=$(host -t TXT "$domain" 2>/dev/null | grep -ci "v=spf1")
+  fi
+
+  if [ -z "$spf_record" ]; then
+    echo -e "  ${RED}ОШИБКА: SPF-запись не найдена!${NC}"
+    echo -e "  ${YELLOW}Добавьте TXT-запись: \"v=spf1 a mx ip4:${server_ip} ~all\"${NC}"
+    issues=$((issues+1))
+  else
+    # Проверяем на дубликаты SPF
+    if [ "$spf_count" -gt 1 ]; then
+      echo -e "  ${RED}ОШИБКА: Найдено ${spf_count} SPF-записей! Должна быть только одна.${NC}"
+      echo "$spf_record" | while IFS= read -r line; do
+        echo -e "    ${CYAN}• ${line}${NC}"
+      done
+      echo -e "  ${YELLOW}Удалите лишние и оставьте одну: \"v=spf1 a mx ip4:${server_ip} ~all\"${NC}"
+      issues=$((issues+1))
+      fix_spf_dup=true
+    else
+      echo -e "  ${GREEN}OK: ${spf_record}${NC}"
+    fi
+    # Проверяем, содержит ли SPF ip сервера
+    if ! echo "$spf_record" | grep -qE "(ip4:${server_ip}|a |mx |all)"; then
+      echo -e "  ${YELLOW}ВНИМАНИЕ: SPF может не включать IP сервера ${server_ip}${NC}"
+      warnings=$((warnings+1))
+    fi
+  fi
+  echo ""
+
+  # --- 5. DKIM ---
+  echo -e "${BOLD}${YELLOW}[5/7] DKIM-запись (dkim._domainkey.${domain})${NC}"
+
+  # Проверяем наличие ключа на сервере
+  local dkim_key_exists=false
+  if [ -f "/etc/opendkim/keys/$domain/dkim.private" ]; then
+    dkim_key_exists=true
+    echo -e "  ${GREEN}Ключ на сервере: найден${NC}"
+  else
+    echo -e "  ${RED}Ключ на сервере: НЕ НАЙДЕН (/etc/opendkim/keys/$domain/dkim.private)${NC}"
+    issues=$((issues+1))
+  fi
+
+  # Проверяем DNS-запись DKIM
+  local dkim_dns=""
+  if command -v dig >/dev/null 2>&1; then
+    dkim_dns=$(dig +short TXT "dkim._domainkey.${domain}" 2>/dev/null | tr -d '"' | tr -d ' ')
+  elif command -v host >/dev/null 2>&1; then
+    dkim_dns=$(host -t TXT "dkim._domainkey.${domain}" 2>/dev/null | grep "descriptive text" | sed 's/.*"\(.*\)"/\1/' | tr -d ' ')
+  fi
+
+  if [ -z "$dkim_dns" ]; then
+    echo -e "  ${RED}ОШИБКА: DKIM DNS-запись не найдена!${NC}"
+    if [ "$dkim_key_exists" = true ] && [ -f "/etc/opendkim/keys/$domain/dkim.txt" ]; then
+      local dkim_pub=$(grep -oP 'p=[^";\s)]+' "/etc/opendkim/keys/$domain/dkim.txt" | sed 's/^p=//' | tr -d '\n" ')
+      if [ -n "$dkim_pub" ]; then
+        echo -e "  ${YELLOW}Добавьте TXT-запись для dkim._domainkey:${NC}"
+        echo -e "  ${CYAN}v=DKIM1; h=sha256; k=rsa; p=${dkim_pub}${NC}"
+      fi
+    fi
+    issues=$((issues+1))
+  else
+    echo -e "  ${GREEN}DNS-запись: найдена${NC}"
+    if echo "$dkim_dns" | grep -q "p="; then
+      echo -e "  ${GREEN}OK: содержит публичный ключ${NC}"
+    else
+      echo -e "  ${RED}ОШИБКА: запись не содержит публичный ключ (p=...)${NC}"
+      issues=$((issues+1))
+    fi
+  fi
+  echo ""
+
+  # --- 6. DMARC ---
+  echo -e "${BOLD}${YELLOW}[6/7] DMARC-запись (_dmarc.${domain})${NC}"
+  local dmarc_record=""
+  if command -v dig >/dev/null 2>&1; then
+    dmarc_record=$(dig +short TXT "_dmarc.${domain}" 2>/dev/null | tr -d '"')
+  elif command -v host >/dev/null 2>&1; then
+    dmarc_record=$(host -t TXT "_dmarc.${domain}" 2>/dev/null | grep "descriptive text" | sed 's/.*"\(.*\)"/\1/')
+  fi
+
+  if [ -z "$dmarc_record" ]; then
+    echo -e "  ${RED}ОШИБКА: DMARC-запись не найдена!${NC}"
+    echo -e "  ${YELLOW}Добавьте TXT-запись для _dmarc: \"v=DMARC1; p=quarantine; rua=mailto:admin@${domain}\"${NC}"
+    issues=$((issues+1))
+  else
+    echo -e "  ${GREEN}OK: ${dmarc_record}${NC}"
+  fi
+  echo ""
+
+  # --- 7. TLS-сертификат ---
+  echo -e "${BOLD}${YELLOW}[7/7] TLS-сертификат${NC}"
+  local tls_cert=$(postconf -h smtpd_tls_cert_file 2>/dev/null)
+  local tls_key=$(postconf -h smtpd_tls_key_file 2>/dev/null)
+
+  if [ -z "$tls_cert" ] || echo "$tls_cert" | grep -q "snakeoil"; then
+    echo -e "  ${RED}ОШИБКА: Используется самоподписанный сертификат (snakeoil)${NC}"
+    echo -e "  ${YELLOW}Можно исправить автоматически (Let's Encrypt)${NC}"
+    issues=$((issues+1))
+    fix_tls=true
+  else
+    if [ -f "$tls_cert" ]; then
+      local cert_domain=$(openssl x509 -in "$tls_cert" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^\s/]+')
+      local cert_expire=$(openssl x509 -in "$tls_cert" -noout -enddate 2>/dev/null | cut -d= -f2)
+      echo -e "  ${GREEN}OK: ${tls_cert}${NC}"
+      echo -e "  ${CYAN}Домен: ${cert_domain:-неизвестно}${NC}"
+      echo -e "  ${CYAN}Истекает: ${cert_expire:-неизвестно}${NC}"
+      if [ -n "$cert_domain" ] && [ "$cert_domain" != "$hostname_fqdn" ]; then
+        echo -e "  ${YELLOW}ВНИМАНИЕ: Сертификат выдан для ${cert_domain}, а hostname — ${hostname_fqdn}${NC}"
+        warnings=$((warnings+1))
+      fi
+    else
+      echo -e "  ${RED}ОШИБКА: Файл сертификата не найден: ${tls_cert}${NC}"
+      issues=$((issues+1))
+    fi
+  fi
+  echo ""
+
+  # --- Дополнительные проверки ---
+  echo -e "${BOLD}${YELLOW}[Доп.] Проверка сервисов${NC}"
+
+  # Postfix
+  if systemctl is-active --quiet postfix 2>/dev/null; then
+    echo -e "  ${GREEN}Postfix: запущен${NC}"
+  else
+    echo -e "  ${RED}Postfix: НЕ запущен!${NC}"
+    issues=$((issues+1))
+    fix_services_postfix=true
+  fi
+
+  # Dovecot
+  if systemctl is-active --quiet dovecot 2>/dev/null; then
+    echo -e "  ${GREEN}Dovecot: запущен${NC}"
+  else
+    echo -e "  ${RED}Dovecot: НЕ запущен!${NC}"
+    issues=$((issues+1))
+    fix_services_dovecot=true
+  fi
+
+  # OpenDKIM
+  if systemctl is-active --quiet opendkim 2>/dev/null; then
+    echo -e "  ${GREEN}OpenDKIM: запущен${NC}"
+  else
+    echo -e "  ${RED}OpenDKIM: НЕ запущен! (письма не будут подписываться DKIM)${NC}"
+    issues=$((issues+1))
+    fix_services_opendkim=true
+  fi
+  echo ""
+
+  # --- Проверка IP в популярных блеклистах ---
+  echo -e "${BOLD}${YELLOW}[Доп.] Проверка IP ${server_ip} в блеклистах${NC}"
+  local reversed_ip=$(echo "$server_ip" | awk -F. '{print $4"."$3"."$2"."$1}')
+  local blacklists=("zen.spamhaus.org" "bl.spamcop.net" "b.barracudacentral.org" "dnsbl.sorbs.net")
+  local bl_issues=0
+
+  for bl in "${blacklists[@]}"; do
+    local bl_result=""
+    if command -v dig >/dev/null 2>&1; then
+      bl_result=$(dig +short "${reversed_ip}.${bl}" A 2>/dev/null | head -1)
+    elif command -v host >/dev/null 2>&1; then
+      bl_result=$(host "${reversed_ip}.${bl}" 2>/dev/null | grep "has address" | head -1)
+    fi
+
+    if [ -n "$bl_result" ] && [[ "$bl_result" =~ ^127\. ]]; then
+      echo -e "  ${RED}В БЛЕКЛИСТЕ: ${bl}${NC}"
+      bl_issues=$((bl_issues+1))
+    else
+      echo -e "  ${GREEN}OK: ${bl}${NC}"
+    fi
+  done
+
+  if [ $bl_issues -gt 0 ]; then
+    echo -e "  ${RED}IP находится в ${bl_issues} блеклисте(ах)! Это основная причина отклонения писем.${NC}"
+    echo -e "  ${YELLOW}Обратитесь к провайдеру для смены IP или подайте заявку на делист.${NC}"
+    issues=$((issues+bl_issues))
+  fi
+  echo ""
+
+  # --- Итог ---
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  if [ $issues -eq 0 ] && [ $warnings -eq 0 ]; then
+    echo -e "${GREEN}${BOLD}Все проверки пройдены успешно!${NC}"
+    echo -e "${YELLOW}Если письма всё ещё отклоняются, возможно проблема в содержимом письма${NC}"
+    echo -e "${YELLOW}или в репутации нового IP (нужно время на \"прогрев\").${NC}"
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo ""
+    echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+    read
+    set -e; return 0
+  fi
+
+  echo -e "${RED}${BOLD}Обнаружено проблем: ${issues}${NC}"
+  if [ $warnings -gt 0 ]; then
+    echo -e "${YELLOW}${BOLD}Предупреждений: ${warnings}${NC}"
+  fi
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+
+  # Собираем список доступных исправлений
+  local fix_options=()
+  local fix_labels=()
+
+  if [ "$fix_tls" = true ]; then
+    fix_options+=("tls")
+    fix_labels+=("Установить TLS-сертификат Let's Encrypt для ${hostname_fqdn}")
+  fi
+
+  if [ "$fix_services_postfix" = true ] || [ "$fix_services_dovecot" = true ] || [ "$fix_services_opendkim" = true ]; then
+    fix_options+=("services")
+    fix_labels+=("Запустить остановленные сервисы")
+  fi
+
+  if [ "$fix_ptr" = true ]; then
+    fix_options+=("ptr")
+    fix_labels+=("Показать инструкцию по настройке PTR-записи (rDNS)")
+  fi
+
+  if [ "$fix_spf_dup" = true ]; then
+    fix_options+=("spf")
+    fix_labels+=("Показать инструкцию по исправлению SPF-записей")
+  fi
+
+  if [ ${#fix_options[@]} -eq 0 ]; then
+    echo -e "${YELLOW}Нет доступных автоматических исправлений.${NC}"
+    echo ""
+    echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+    read
+    set -e; return 0
+  fi
+
+  # Показываем меню исправлений
+  echo -e "${BOLD}${GREEN}Доступные исправления:${NC}"
+  echo ""
+  for i in "${!fix_options[@]}"; do
+    local auto_tag=""
+    case "${fix_options[$i]}" in
+      tls|services) auto_tag="${GREEN}[авто]${NC} " ;;
+      *) auto_tag="${CYAN}[инструкция]${NC} " ;;
+    esac
+    echo -e "${CYAN}$((i+1)).${NC} ${auto_tag}${fix_labels[$i]}"
+  done
+  echo -e "${CYAN}A.${NC} Выполнить все автоматические исправления"
+  echo -e "${CYAN}0.${NC} Вернуться без исправлений"
+  echo ""
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo -n -e "${GREEN}Ваш выбор: ${NC}"
+  read fix_choice
+
+  if [ "$fix_choice" = "0" ]; then
+    set -e; return 0
+  fi
+
+  if [ "$fix_choice" = "A" ] || [ "$fix_choice" = "a" ]; then
+    echo ""
+    # Выполняем все автоматические исправления
+    if [ "$fix_tls" = true ]; then
+      fix_tls_certificate "$hostname_fqdn"
+    fi
+    if [ "$fix_services_postfix" = true ] || [ "$fix_services_dovecot" = true ] || [ "$fix_services_opendkim" = true ]; then
+      fix_stopped_services "$fix_services_postfix" "$fix_services_dovecot" "$fix_services_opendkim"
+    fi
+    if [ "$fix_ptr" = true ]; then
+      show_ptr_instructions "$server_ip" "$hostname_fqdn"
+    fi
+    if [ "$fix_spf_dup" = true ]; then
+      show_spf_fix_instructions "$domain" "$server_ip"
+    fi
+    echo ""
+    echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+    read
+    set -e; return 0
+  fi
+
+  if [[ "$fix_choice" =~ ^[0-9]+$ ]] && [ "$fix_choice" -ge 1 ] && [ "$fix_choice" -le ${#fix_options[@]} ]; then
+    local selected_fix="${fix_options[$((fix_choice-1))]}"
+    echo ""
+    case "$selected_fix" in
+      tls)
+        fix_tls_certificate "$hostname_fqdn"
+        ;;
+      services)
+        fix_stopped_services "$fix_services_postfix" "$fix_services_dovecot" "$fix_services_opendkim"
+        ;;
+      ptr)
+        show_ptr_instructions "$server_ip" "$hostname_fqdn"
+        ;;
+      spf)
+        show_spf_fix_instructions "$domain" "$server_ip"
+        ;;
+    esac
+  else
+    echo -e "${RED}Некорректный выбор.${NC}"
+  fi
+
+  echo ""
+  echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"
+  read
+  set -e  # Возвращаем выход при ошибке
+}
+
+# Автоматическая установка TLS-сертификата Let's Encrypt
+fix_tls_certificate() {
+  set +e  # Отключаем выход при ошибке для этой функции
+  local hostname_fqdn="$1"
+
+  echo -e "${BOLD}${CYAN}--- Установка TLS-сертификата для ${hostname_fqdn} ---${NC}"
+  echo ""
+
+  # Проверяем наличие certbot
+  if ! command -v certbot >/dev/null 2>&1; then
+    echo -e "${YELLOW}Установка certbot...${NC}"
+    apt update -qq 2>/dev/null
+    apt install -y certbot 2>/dev/null
+    if ! command -v certbot >/dev/null 2>&1; then
+      echo -e "${RED}Не удалось установить certbot.${NC}"
+      set -e
+      return 1
+    fi
+    echo -e "${GREEN}certbot установлен.${NC}"
+  fi
+
+  # Проверяем, есть ли уже сертификат
+  if [ -f "/etc/letsencrypt/live/${hostname_fqdn}/fullchain.pem" ]; then
+    echo -e "${GREEN}Сертификат Let's Encrypt уже существует для ${hostname_fqdn}.${NC}"
+    echo -e "${YELLOW}Обновляем конфигурацию Postfix и Dovecot...${NC}"
+  else
+    # Определяем способ получения сертификата
+    local certbot_method="--standalone"
+    local need_stop_services=false
+
+    # Проверяем, занят ли порт 80
+    if ss -tlnp 2>/dev/null | grep -q ":80 "; then
+      local port80_process=$(ss -tlnp 2>/dev/null | grep ":80 " | grep -oP 'users:\(\("\K[^"]+' | head -1)
+      if [ "$port80_process" = "nginx" ]; then
+        # Если nginx запущен, пробуем через webroot или nginx плагин
+        if [ -d "/var/www/html" ]; then
+          certbot_method="--webroot -w /var/www/html"
+          echo -e "${YELLOW}Обнаружен nginx, используем webroot метод.${NC}"
+        else
+          echo -e "${YELLOW}Обнаружен nginx, временно останавливаем для получения сертификата...${NC}"
+          systemctl stop nginx 2>/dev/null
+          need_stop_services=true
+        fi
+      elif [ "$port80_process" = "apache2" ] || [ "$port80_process" = "httpd" ]; then
+        if [ -d "/var/www/html" ]; then
+          certbot_method="--webroot -w /var/www/html"
+          echo -e "${YELLOW}Обнаружен Apache, используем webroot метод.${NC}"
+        else
+          echo -e "${YELLOW}Обнаружен Apache, временно останавливаем для получения сертификата...${NC}"
+          systemctl stop apache2 2>/dev/null || systemctl stop httpd 2>/dev/null
+          need_stop_services=true
+        fi
+      else
+        echo -e "${YELLOW}Порт 80 занят процессом '${port80_process}'.${NC}"
+        echo -e "${YELLOW}Попробуем остановить nginx если он есть...${NC}"
+        systemctl stop nginx 2>/dev/null
+        need_stop_services=true
+      fi
+    fi
+
+    # Проверяем, открыт ли порт 80 в firewall
+    if command -v ufw >/dev/null 2>&1; then
+      ufw allow 80/tcp 2>/dev/null || true
+    fi
+
+    echo -e "${YELLOW}Запрашиваем сертификат для ${hostname_fqdn}...${NC}"
+    echo ""
+
+    local certbot_output
+    certbot_output=$(certbot certonly $certbot_method -d "$hostname_fqdn" --non-interactive --agree-tos --register-unsafely-without-email 2>&1)
+    local certbot_exit=$?
+
+    # Возвращаем веб-сервер если останавливали
+    if [ "$need_stop_services" = true ]; then
+      systemctl start nginx 2>/dev/null || true
+      systemctl start apache2 2>/dev/null || systemctl start httpd 2>/dev/null || true
+    fi
+
+    if [ $certbot_exit -ne 0 ]; then
+      echo -e "${RED}Ошибка при получении сертификата:${NC}"
+      echo "$certbot_output" | tail -15
+      echo ""
+      echo -e "${YELLOW}Возможные причины:${NC}"
+      echo -e "${CYAN}•${NC} A-запись для ${hostname_fqdn} не указывает на этот сервер"
+      echo -e "${CYAN}•${NC} Порт 80 недоступен извне (проверьте firewall: ufw allow 80/tcp)"
+      echo -e "${CYAN}•${NC} Порт 80 занят другим процессом"
+      echo -e "${CYAN}•${NC} Превышен лимит запросов Let's Encrypt"
+      echo ""
+      echo -e "${YELLOW}Попробуйте вручную:${NC}"
+      echo -e "${CYAN}systemctl stop nginx 2>/dev/null; certbot certonly --standalone -d ${hostname_fqdn}${NC}"
+      set -e
+      return 1
+    fi
+
+    echo -e "${GREEN}Сертификат успешно получен!${NC}"
+  fi
+
+  # Обновляем Postfix
+  echo -e "${YELLOW}Обновление конфигурации Postfix...${NC}"
+  postconf -e "smtpd_tls_cert_file=/etc/letsencrypt/live/${hostname_fqdn}/fullchain.pem"
+  postconf -e "smtpd_tls_key_file=/etc/letsencrypt/live/${hostname_fqdn}/privkey.pem"
+  echo -e "${GREEN}Postfix обновлен.${NC}"
+
+  # Обновляем Dovecot
+  echo -e "${YELLOW}Обновление конфигурации Dovecot...${NC}"
+  if [ -f "/etc/dovecot/conf.d/10-ssl.conf" ]; then
+    cat > /etc/dovecot/conf.d/10-ssl.conf <<EOF
+ssl = required
+ssl_cert = </etc/letsencrypt/live/${hostname_fqdn}/fullchain.pem
+ssl_key = </etc/letsencrypt/live/${hostname_fqdn}/privkey.pem
+EOF
+    echo -e "${GREEN}Dovecot обновлен.${NC}"
+  else
+    echo -e "${YELLOW}Файл 10-ssl.conf не найден, пропускаем Dovecot.${NC}"
+  fi
+
+  # Настраиваем автообновление сертификата с перезапуском сервисов
+  echo -e "${YELLOW}Настройка автообновления сертификата...${NC}"
+  local renew_hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
+  mkdir -p "$renew_hook_dir"
+  cat > "${renew_hook_dir}/mail-services.sh" <<'HOOK'
+#!/bin/bash
+systemctl restart postfix dovecot 2>/dev/null || true
+HOOK
+  chmod +x "${renew_hook_dir}/mail-services.sh"
+  echo -e "${GREEN}Автообновление настроено.${NC}"
+
+  # Перезапускаем сервисы
+  echo -e "${YELLOW}Перезапуск Postfix и Dovecot...${NC}"
+  systemctl restart postfix 2>/dev/null || true
+  systemctl restart dovecot 2>/dev/null || true
+  echo -e "${GREEN}Сервисы перезапущены.${NC}"
+  echo ""
+  echo -e "${GREEN}${BOLD}TLS-сертификат успешно установлен и настроен!${NC}"
+  echo ""
+  set -e  # Возвращаем выход при ошибке
+}
+
+# Запуск остановленных сервисов
+fix_stopped_services() {
+  set +e  # Отключаем выход при ошибке
+  local fix_postfix="$1"
+  local fix_dovecot="$2"
+  local fix_opendkim="$3"
+
+  echo -e "${BOLD}${CYAN}--- Запуск остановленных сервисов ---${NC}"
+  echo ""
+
+  if [ "$fix_postfix" = true ]; then
+    echo -e "${YELLOW}Запуск Postfix...${NC}"
+    systemctl start postfix 2>/dev/null
+    if systemctl is-active --quiet postfix 2>/dev/null; then
+      echo -e "${GREEN}Postfix запущен.${NC}"
+    else
+      echo -e "${RED}Не удалось запустить Postfix. Проверьте: journalctl -u postfix -n 20${NC}"
+    fi
+  fi
+
+  if [ "$fix_dovecot" = true ]; then
+    echo -e "${YELLOW}Запуск Dovecot...${NC}"
+    systemctl start dovecot 2>/dev/null
+    if systemctl is-active --quiet dovecot 2>/dev/null; then
+      echo -e "${GREEN}Dovecot запущен.${NC}"
+    else
+      echo -e "${RED}Не удалось запустить Dovecot. Проверьте: journalctl -u dovecot -n 20${NC}"
+    fi
+  fi
+
+  if [ "$fix_opendkim" = true ]; then
+    echo -e "${YELLOW}Запуск OpenDKIM...${NC}"
+    systemctl start opendkim 2>/dev/null
+    if systemctl is-active --quiet opendkim 2>/dev/null; then
+      echo -e "${GREEN}OpenDKIM запущен.${NC}"
+    else
+      echo -e "${RED}Не удалось запустить OpenDKIM. Проверьте: journalctl -u opendkim -n 20${NC}"
+    fi
+  fi
+  echo ""
+  set -e  # Возвращаем выход при ошибке
+}
+
+# Инструкция по настройке PTR-записи
+show_ptr_instructions() {
+  local server_ip="$1"
+  local hostname_fqdn="$2"
+
+  echo -e "${BOLD}${CYAN}--- Настройка PTR-записи (rDNS) ---${NC}"
+  echo ""
+  echo -e "${YELLOW}PTR-запись нельзя настроить с сервера — она настраивается${NC}"
+  echo -e "${YELLOW}в панели управления вашего хостинг-провайдера/VPS.${NC}"
+  echo ""
+  echo -e "${BOLD}Необходимо установить:${NC}"
+  echo -e "  ${CYAN}IP:${NC}    ${server_ip}"
+  echo -e "  ${CYAN}rDNS:${NC}  ${hostname_fqdn}"
+  echo ""
+  echo -e "${BOLD}Где настроить (зависит от провайдера):${NC}"
+  echo -e "  ${CYAN}•${NC} ${BOLD}Hetzner:${NC}     Cloud Console -> Servers -> Networking -> rDNS"
+  echo -e "  ${CYAN}•${NC} ${BOLD}DigitalOcean:${NC} Droplets -> Networking -> PTR Record (через поддержку)"
+  echo -e "  ${CYAN}•${NC} ${BOLD}Vultr:${NC}        Products -> Server -> Settings -> IPv4 -> Reverse DNS"
+  echo -e "  ${CYAN}•${NC} ${BOLD}AWS EC2:${NC}      Elastic IP -> Edit Reverse DNS"
+  echo -e "  ${CYAN}•${NC} ${BOLD}OVH:${NC}          IP -> Manage IPs -> Reverse"
+  echo -e "  ${CYAN}•${NC} ${BOLD}Selectel:${NC}     Серверы -> Сети -> IP -> Обратная DNS-запись"
+  echo -e "  ${CYAN}•${NC} ${BOLD}TimeWeb:${NC}      Серверы -> Настройки -> PTR-запись"
+  echo -e "  ${CYAN}•${NC} ${BOLD}REG.RU:${NC}       VPS -> Настройки сервера -> PTR-запись"
+  echo -e "  ${CYAN}•${NC} ${BOLD}Beget:${NC}        Главная -> VPS -> Выбрать сервер -> Настройки -> PTR-запись"
+  echo ""
+  echo -e "${RED}${BOLD}Это самая критичная проблема!${NC} Без PTR-записи Яндекс, Mail.ru и Gmail${NC}"
+  echo -e "${YELLOW}будут отклонять или отправлять письма в спам.${NC}"
+  echo ""
+}
+
+# Инструкция по исправлению дублей SPF
+show_spf_fix_instructions() {
+  local domain="$1"
+  local server_ip="$2"
+
+  echo -e "${BOLD}${CYAN}--- Исправление дублирующихся SPF-записей ---${NC}"
+  echo ""
+  echo -e "${RED}У домена ${domain} несколько SPF-записей.${NC}"
+  echo -e "${YELLOW}По стандарту RFC 7208, домен должен иметь только одну SPF-запись.${NC}"
+  echo -e "${YELLOW}Несколько записей приводят к ошибке валидации (PermError).${NC}"
+  echo ""
+  echo -e "${BOLD}Что нужно сделать:${NC}"
+  echo -e "  ${CYAN}1.${NC} Откройте DNS-панель домена ${domain}"
+  echo -e "  ${CYAN}2.${NC} Найдите все TXT-записи, содержащие ${BOLD}v=spf1${NC}"
+  echo -e "  ${CYAN}3.${NC} Удалите все кроме одной"
+  echo -e "  ${CYAN}4.${NC} Оставьте (или замените на):"
+  echo ""
+  echo -e "  ${GREEN}${BOLD}v=spf1 a mx ip4:${server_ip} ~all${NC}"
+  echo ""
+  echo -e "${YELLOW}Объяснение:${NC}"
+  echo -e "  ${CYAN}a${NC}    — разрешить IP из A-записи домена"
+  echo -e "  ${CYAN}mx${NC}   — разрешить IP из MX-записи"
+  echo -e "  ${CYAN}ip4:${server_ip}${NC} — явно разрешить IP сервера"
+  echo -e "  ${CYAN}~all${NC} — мягкий отказ для остальных (softfail)"
+  echo ""
 }
 
 # Создание Python HTTP сервера для endpoint отправки писем
@@ -2826,16 +3840,18 @@ show_main_menu() {
     echo -e "${YELLOW}Выберите действие:${NC}"
     echo -e "${CYAN}1.${NC} Установить почтовый сервер"
     echo -e "${CYAN}2.${NC} Добавить домен/почтовый ящик"
-    echo -e "${CYAN}3.${NC} Просмотреть домены и почтовые ящики"
-    echo -e "${CYAN}4.${NC} Создать endpoint для отправки писем"
-    echo -e "${CYAN}5.${NC} Управление endpoint для отправки писем"
-    echo -e "${CYAN}6.${NC} Очистить все данные почтового сервера"
-    echo -e "${CYAN}7.${NC} Завершить работу скрипта"
+    echo -e "${CYAN}3.${NC} Удалить домен/почтовый ящик"
+    echo -e "${CYAN}4.${NC} Просмотреть домены и почтовые ящики"
+    echo -e "${CYAN}5.${NC} Диагностика домена (DNS, DKIM, SPF, блеклисты)"
+    echo -e "${CYAN}6.${NC} Создать endpoint для отправки писем"
+    echo -e "${CYAN}7.${NC} Управление endpoint для отправки писем"
+    echo -e "${CYAN}8.${NC} Очистить все данные почтового сервера"
+    echo -e "${CYAN}9.${NC} Завершить работу скрипта"
     echo ""
     echo -e "${YELLOW}---------------------------------------------${NC}"
-    echo -n -e "${GREEN}Ваш выбор (1-7): ${NC}"
+    echo -n -e "${GREEN}Ваш выбор (1-9): ${NC}"
     read main_choice
-    
+
     case $main_choice in
       1)
         if input_mail_server_config; then
@@ -2852,18 +3868,24 @@ show_main_menu() {
         add_domain_mailbox
         ;;
       3)
-        view_domains_mailboxes
+        delete_domain_mailbox
         ;;
       4)
-        create_mail_endpoint
+        view_domains_mailboxes
         ;;
       5)
-        manage_mail_endpoints
+        diagnose_domain
         ;;
       6)
-        cleanup_all
+        create_mail_endpoint
         ;;
       7)
+        manage_mail_endpoints
+        ;;
+      8)
+        cleanup_all
+        ;;
+      9)
         clear_screen
         echo -e "${GREEN}${BOLD}Завершение работы скрипта. До свидания!${NC}"
         return 0
