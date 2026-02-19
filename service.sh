@@ -121,6 +121,40 @@ clear_screen() {
   clear
 }
 
+# Безопасная функция перезагрузки/запуска nginx
+safe_nginx_reload() {
+  # Проверяем, запущен ли nginx
+  if systemctl is-active --quiet nginx; then
+    # Nginx запущен - используем reload (не роняет процесс, не отпускает порты)
+    systemctl reload nginx
+    return $?
+  else
+    # Nginx не запущен - проверяем, не занят ли порт 80 другим процессом
+    local port_pid=$(ss -tlnp 2>/dev/null | grep ':80 ' | grep -oP 'pid=\K[0-9]+' | head -1)
+    if [ -n "$port_pid" ]; then
+      local port_process=$(ps -p "$port_pid" -o comm= 2>/dev/null)
+      if [ "$port_process" = "nginx" ]; then
+        # Это зависший nginx процесс вне systemd - убиваем и запускаем
+        echo -e "${YELLOW}Обнаружен зависший процесс nginx (PID: $port_pid). Останавливаем...${NC}"
+        kill "$port_pid" 2>/dev/null
+        sleep 1
+        # Если ещё жив - SIGKILL
+        if kill -0 "$port_pid" 2>/dev/null; then
+          kill -9 "$port_pid" 2>/dev/null
+          sleep 1
+        fi
+      else
+        echo -e "${RED}Порт 80 занят процессом: ${BOLD}$port_process${NC} (PID: $port_pid)"
+        echo -e "${YELLOW}Остановите этот процесс перед запуском nginx.${NC}"
+        return 1
+      fi
+    fi
+    # Запускаем nginx
+    systemctl start nginx
+    return $?
+  fi
+}
+
 # Функция для выбора режима запуска
 select_runtime() {
   clear_screen
@@ -899,7 +933,7 @@ delete_nginx_config() {
     if [ $? -eq 0 ]; then
       # Перезагружаем nginx
       echo -e "${YELLOW}Перезагрузка nginx...${NC}"
-      systemctl reload nginx
+      safe_nginx_reload
       echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
     else
       echo -e "${RED}Ошибка в конфигурации nginx!${NC}"
@@ -968,7 +1002,7 @@ edit_nginx_config() {
       
       # Перезагружаем nginx
       echo -e "${YELLOW}Перезагрузка nginx...${NC}"
-      systemctl reload nginx
+      safe_nginx_reload
       
       if [ $? -eq 0 ]; then
         echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
@@ -1031,7 +1065,7 @@ toggle_nginx_config() {
         if [ $? -eq 0 ]; then
           # Перезагружаем nginx
           echo -e "${YELLOW}Перезагрузка nginx...${NC}"
-          systemctl reload nginx
+          safe_nginx_reload
           echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
         fi
       else
@@ -1059,7 +1093,7 @@ toggle_nginx_config() {
         if [ $? -eq 0 ]; then
           # Перезагружаем nginx
           echo -e "${YELLOW}Перезагрузка nginx...${NC}"
-          systemctl reload nginx
+          safe_nginx_reload
           echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
         else
           echo -e "${RED}Ошибка в конфигурации nginx! Проверьте настройки.${NC}"
@@ -1307,13 +1341,13 @@ EOF
     
     if [ $? -eq 0 ]; then
       echo -e "${YELLOW}Перезагрузка nginx...${NC}"
-      systemctl reload nginx
+      safe_nginx_reload
       echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
     else
       echo -e "${RED}Ошибка в конфигурации nginx!${NC}"
       echo -e "${YELLOW}Восстанавливаем резервную копию...${NC}"
       mv "$backup_path" "$config_path"
-      systemctl reload nginx
+      safe_nginx_reload
       sleep 3
       return 1
     fi
@@ -1440,7 +1474,7 @@ issue_ssl_certificate() {
     if [ ! -L "$enabled_path" ]; then
       echo -e "${YELLOW}Конфигурация не активирована. Активируем...${NC}"
       ln -s "$config_path" "$enabled_path"
-      systemctl reload nginx
+      safe_nginx_reload
     fi
     
     # Проверяем наличие зарегистрированного аккаунта certbot
@@ -1509,7 +1543,7 @@ issue_ssl_certificate() {
       
       if [ $? -eq 0 ]; then
         echo -e "${YELLOW}Перезагрузка nginx...${NC}"
-        systemctl reload nginx
+        safe_nginx_reload
         echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
       fi
     else
@@ -2153,8 +2187,8 @@ EOF
   
   # Перезагружаем nginx
   echo -e "${YELLOW}Перезагрузка nginx...${NC}"
-  systemctl reload nginx
-  
+  safe_nginx_reload
+
   if [ $? -eq 0 ]; then
     echo -e "${GREEN}Nginx успешно перезагружен!${NC}"
   else
