@@ -2718,7 +2718,8 @@ print_two_col() {
   local plain bytes cont len pad
   plain=$(printf '%b' "$left" | sed 's/\x1b\[[0-9;]*m//g')
   bytes=$(printf '%s' "$plain" | wc -c)
-  cont=$(printf '%s' "$plain" | grep -aoP '[\x80-\xBF]' 2>/dev/null | wc -l)
+  # UTF-8 continuation-байты (0x80-0xBF) считаем через tr — портативно, без PCRE
+  cont=$(printf '%s' "$plain" | tr -cd '\200-\277' | wc -c)
   len=$(( bytes - cont )); [ "$len" -lt 0 ] && len=0
   pad=$(( w - len )); [ "$pad" -lt 0 ] && pad=0
   printf '%b%*s  %b\n' "$left" "$pad" "" "$right"

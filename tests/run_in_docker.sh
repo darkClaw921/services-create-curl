@@ -379,6 +379,11 @@ echo "$panel" | grep -qE '· .*api.com' && ok "compact: выключенный �
 # print_two_col выравнивает с учётом ANSI
 tc=$(call_fn print_two_col "$(printf '\033[0;36mLEFT\033[0m')" "RIGHT" 10)
 echo "$tc" | grep -q 'LEFT' && echo "$tc" | grep -q 'RIGHT' && ok "print_two_col: обе колонки в строке" || bad "print_two_col" "$tc"
+# Выравнивание с КИРИЛЛИЦЕЙ: видимая ширина левой колонки до правой = w+2
+tc=$(call_fn print_two_col "Создать" "MARK" 20)
+prefix="${tc%%MARK*}"
+vis=$(( $(printf '%s' "$prefix" | wc -c) - $(printf '%s' "$prefix" | tr -cd '\200-\277' | wc -c) ))
+[ "$vis" -eq 22 ] && ok "print_two_col: кириллица выравнивается (видимая ширина=22)" || bad "print_two_col cyrillic align" "vis=$vis prefix='$prefix'"
 
 # =====================================================================
 section "13. РЕАЛЬНЫЙ жизненный цикл сервиса через systemctl"
