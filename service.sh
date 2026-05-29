@@ -2710,17 +2710,29 @@ nginx_compact_list() {
   return 0
 }
 
+# Видимая длина строки с ANSI-цветами и UTF-8 (кириллица).
+# Считаем в видимых символах: байты минус UTF-8 continuation-байты.
+# ANSI снимаем переносимо — литеральный ESC в sed (работает и в BSD, и в GNU sed,
+# в отличие от \x1b, который понимает только GNU sed).
+visible_len() {
+  local plain bytes cont len esc
+  esc=$(printf '\033')
+  plain=$(printf '%b' "$1" | sed "s/${esc}\[[0-9;]*m//g")
+  bytes=$(printf '%s' "$plain" | wc -c)
+  # LC_ALL=C — чтобы tr работал по сырым байтам, а не по символам локали
+  # (иначе BSD tr в UTF-8-локали не находит continuation-байты 0x80-0xBF).
+  cont=$(printf '%s' "$plain" | LC_ALL=C tr -cd '\200-\277' | wc -c)
+  len=$(( bytes - cont )); [ "$len" -lt 0 ] && len=0
+  printf '%s' "$len"
+}
+
 # Печать строки в две колонки (левая может содержать ANSI-цвета и UTF-8).
-# Ширину считаем в видимых символах: байты минус UTF-8 continuation-байты,
-# что корректно для кириллицы независимо от локали.
+# $3 — ширина левой колонки в видимых символах: правая колонка начинается ровно
+# на позиции $3+2, поэтому при едином w все строки выровнены.
 print_two_col() {
   local left="$1" right="$2" w="${3:-40}"
-  local plain bytes cont len pad
-  plain=$(printf '%b' "$left" | sed 's/\x1b\[[0-9;]*m//g')
-  bytes=$(printf '%s' "$plain" | wc -c)
-  # UTF-8 continuation-байты (0x80-0xBF) считаем через tr — портативно, без PCRE
-  cont=$(printf '%s' "$plain" | tr -cd '\200-\277' | wc -c)
-  len=$(( bytes - cont )); [ "$len" -lt 0 ] && len=0
+  local len pad
+  len=$(visible_len "$left")
   pad=$(( w - len )); [ "$pad" -lt 0 ] && pad=0
   printf '%b%*s  %b\n' "$left" "$pad" "" "$right"
 }
@@ -2748,12 +2760,30 @@ nginx_menu() {
     echo -e "${BOLD}${CYAN}============================================================================${NC}"
     echo ""
 
+    # Ширина терминала (для привязки правой панели к правому краю)
+    local cols; cols=$(tput cols 2>/dev/null)
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=80
+
+    # Самая широкая строка слева и справа (в видимых символах)
+    local leftmax=0 rightmax=0 vl
+    for vl in "${LEFT[@]}"; do
+      local n; n=$(visible_len "$vl"); [ "$n" -gt "$leftmax" ] && leftmax="$n"
+    done
+    for vl in "${RIGHT[@]}"; do
+      local n; n=$(visible_len "$vl"); [ "$n" -gt "$rightmax" ] && rightmax="$n"
+    done
+
+    # Левую колонку растягиваем так, чтобы правая панель прижалась к правому краю
+    # (cols - rightmax), но не уже, чем самый длинный пункт меню + 2 на отступ.
+    local leftw=$(( cols - rightmax - 2 ))
+    [ "$leftw" -lt "$(( leftmax + 2 ))" ] && leftw=$(( leftmax + 2 ))
+
     # Выводим обе колонки построчно
     local rows=${#LEFT[@]}
     [ ${#RIGHT[@]} -gt "$rows" ] && rows=${#RIGHT[@]}
     local i
     for (( i=0; i<rows; i++ )); do
-      print_two_col "${LEFT[$i]:-}" "${RIGHT[$i]:-}" 38
+      print_two_col "${LEFT[$i]:-}" "${RIGHT[$i]:-}" "$leftw"
     done
 
     echo ""
