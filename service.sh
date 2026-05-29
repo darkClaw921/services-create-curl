@@ -690,9 +690,10 @@ service_control() {
           echo -e "${YELLOW}Перезагрузка конфигурации systemd...${NC}"
           systemctl daemon-reload
           
-          # Удаляем запись из списка
+          # Удаляем запись из списка (точное сравнение первого поля,
+          # чтобы удалился только этот сервис, а не похожие по имени)
           local temp_file=$(mktemp)
-          grep -v "^$service_name:" "$SERVICES_LIST_FILE" > "$temp_file"
+          awk -F: -v name="$service_name" '$1 != name' "$SERVICES_LIST_FILE" > "$temp_file"
           mv "$temp_file" "$SERVICES_LIST_FILE"
           
           echo -e "${GREEN}${BOLD}Сервис $service_name успешно удален.${NC}"
@@ -2364,6 +2365,436 @@ manage_notifications() {
 }
 
 # Функция для отображения главного меню
+# Функция создания GitHub Actions self-hosted раннера для проекта
+create_github_runner() {
+  clear_screen
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo -e "${BOLD}${CYAN}     СОЗДАНИЕ GITHUB ACTIONS RUNNER          ${NC}"
+  echo -e "${BOLD}${CYAN}==============================================${NC}"
+  echo ""
+
+  # Проверяем наличие curl
+  if ! check_command "curl"; then
+    echo -e "${RED}Для установки раннера требуется curl. Установите его и повторите.${NC}"
+    sleep 2
+    return 1
+  fi
+
+  # Запрашиваем репозиторий
+  echo -e "${YELLOW}Укажите данные для регистрации раннера:${NC}"
+  echo ""
+  echo -n -e "${GREEN}Репозиторий в формате owner/repo: ${NC}"
+  read runner_repo
+
+  if ! [[ "$runner_repo" =~ ^[^/]+/[^/]+$ ]]; then
+    echo -e "${RED}Некорректный формат! Требуется owner/repo (например, darkClaw921/services-create-curl).${NC}"
+    sleep 2
+    return 1
+  fi
+
+  # Запрашиваем токен регистрации
+  echo ""
+  echo -e "${CYAN}Токен регистрации (одноразовый, ~1 час) можно получить:${NC}"
+  echo -e "${CYAN}  GitHub → репо → Settings → Actions → Runners → New self-hosted runner${NC}"
+  echo ""
+  echo -n -e "${GREEN}Введите токен регистрации: ${NC}"
+  read runner_token
+
+  if [ -z "$runner_token" ]; then
+    echo -e "${RED}Токен не может быть пустым!${NC}"
+    sleep 2
+    return 1
+  fi
+
+  # Опциональные лейблы
+  echo ""
+  echo -n -e "${GREEN}Лейблы через запятую (Enter — по умолчанию self-hosted): ${NC}"
+  read runner_labels
+
+  # Скачиваем setup-runner.sh во временный файл
+  local tmp_runner
+  tmp_runner=$(mktemp /tmp/setup-runner.XXXXXX.sh)
+  # Гарантируем удаление временного файла при любом выходе из функции
+  trap 'rm -f "$tmp_runner"' RETURN
+
+  local runner_url="https://raw.githubusercontent.com/darkClaw921/services-create-curl/master/setup-runner.sh"
+
+  echo ""
+  echo -e "${YELLOW}Скачивание setup-runner.sh...${NC}"
+  if ! curl -fsSL "$runner_url" -o "$tmp_runner"; then
+    echo -e "${RED}Не удалось скачать setup-runner.sh с ${runner_url}${NC}"
+    sleep 2
+    return 1
+  fi
+
+  echo -e "${GREEN}Скрипт загружен. Запуск установки раннера...${NC}"
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  echo ""
+
+  # Запускаем в отдельном процессе bash (у setup-runner.sh свой set -euo pipefail)
+  if [ -n "$runner_labels" ]; then
+    bash "$tmp_runner" "$runner_repo" "$runner_token" --labels "$runner_labels"
+  else
+    bash "$tmp_runner" "$runner_repo" "$runner_token"
+  fi
+  local runner_status=$?
+
+  echo ""
+  echo -e "${YELLOW}---------------------------------------------${NC}"
+  if [ "$runner_status" -eq 0 ]; then
+    echo -e "${GREEN}${BOLD}✅ Раннер для ${runner_repo} настроен.${NC}"
+    echo -e "${CYAN}Проверьте в GitHub: репо → Settings → Actions → Runners (статус 'Idle').${NC}"
+  else
+    echo -e "${RED}${BOLD}❌ Ошибка установки раннера (код $runner_status).${NC}"
+  fi
+
+  # Временный файл удалится через trap ... RETURN
+  return 0
+}
+
+# Поиск установленных GitHub Actions раннеров (каталоги actions-runner-*)
+find_github_runners() {
+  local base d
+  for base in /root /home/*; do
+    [ -d "$base" ] || continue
+    for d in "$base"/actions-runner-*; do
+      [ -d "$d" ] && [ -f "$d/config.sh" ] && echo "$d"
+    done
+  done
+}
+
+# Имя systemd-юнита раннера (actions-runner создаёт файл .service с именем юнита)
+runner_service_name() {
+  local dir="$1"
+  if [ -f "$dir/.service" ]; then
+    tr -d '[:space:]' < "$dir/.service"
+  fi
+}
+
+# Репозиторий раннера (из .runner -> gitHubUrl, иначе из имени каталога)
+runner_repo_name() {
+  local dir="$1"
+  if [ -f "$dir/.runner" ]; then
+    local url
+    url=$(grep -oE '"gitHubUrl"[^,]*' "$dir/.runner" 2>/dev/null | grep -oE 'https?://[^"]+' | head -1)
+    if [ -n "$url" ]; then
+      echo "${url#*github.com/}"
+      return 0
+    fi
+  fi
+  basename "$dir" | sed 's/^actions-runner-//'
+}
+
+# Меню управления одним раннером
+github_runner_control() {
+  local dir="$1"
+  local repo unit
+
+  while true; do
+    clear_screen
+    repo=$(runner_repo_name "$dir")
+    unit=$(runner_service_name "$dir")
+
+    local status_text="${YELLOW}неизвестно${NC}"
+    if [ -n "$unit" ]; then
+      if systemctl is-active --quiet "$unit" 2>/dev/null; then
+        status_text="${GREEN}активен${NC}"
+      else
+        status_text="${RED}неактивен${NC}"
+      fi
+    fi
+
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo -e "${BOLD}${CYAN}   УПРАВЛЕНИЕ РАННЕРОМ                        ${NC}"
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo ""
+    echo -e "${BOLD}Репозиторий:${NC} $repo"
+    echo -e "${BOLD}Каталог:${NC} $dir"
+    echo -e "${BOLD}Сервис:${NC} ${unit:-${YELLOW}не установлен как сервис${NC}}"
+    echo -e "${BOLD}Статус:${NC} $status_text"
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo ""
+    echo -e "${YELLOW}Выберите действие:${NC}"
+    echo -e "${CYAN}1.${NC} Запустить раннер"
+    echo -e "${CYAN}2.${NC} Остановить раннер"
+    echo -e "${CYAN}3.${NC} Перезапустить раннер"
+    echo -e "${CYAN}4.${NC} Статус раннера"
+    echo -e "${CYAN}5.${NC} Просмотреть логи"
+    echo -e "${CYAN}6.${NC} Удалить раннер (отвязать сервис)"
+    echo -e "${CYAN}7.${NC} Назад к списку раннеров"
+    echo ""
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo -n -e "${GREEN}Ваш выбор (1-7): ${NC}"
+    read runner_action
+
+    case $runner_action in
+      1)
+        echo -e "${YELLOW}Запуск раннера...${NC}"
+        ( cd "$dir" && ./svc.sh start )
+        echo ""
+        echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
+        ;;
+      2)
+        echo -e "${YELLOW}Остановка раннера...${NC}"
+        ( cd "$dir" && ./svc.sh stop )
+        echo ""
+        echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
+        ;;
+      3)
+        echo -e "${YELLOW}Перезапуск раннера...${NC}"
+        ( cd "$dir" && ./svc.sh stop && ./svc.sh start )
+        echo ""
+        echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
+        ;;
+      4)
+        echo -e "${YELLOW}Статус раннера:${NC}"
+        ( cd "$dir" && ./svc.sh status )
+        echo ""
+        echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
+        ;;
+      5)
+        if [ -n "$unit" ]; then
+          # переиспользуем общий просмотрщик журналов systemd
+          view_service_logs "$unit"
+        else
+          echo -e "${RED}Не удалось определить имя сервиса для просмотра логов.${NC}"
+          sleep 2
+        fi
+        ;;
+      6)
+        echo -e "${RED}${BOLD}Удалить раннер для $repo? Сервис будет остановлен и отвязан. (y/n): ${NC}"
+        read confirm_del
+        if [[ "$confirm_del" == "y" || "$confirm_del" == "Y" ]]; then
+          echo -e "${YELLOW}Остановка и отвязка сервиса...${NC}"
+          ( cd "$dir" && ./svc.sh stop 2>/dev/null; ./svc.sh uninstall 2>/dev/null )
+          echo -e "${GREEN}Сервис раннера отвязан.${NC}"
+          echo ""
+          echo -e "${YELLOW}Каталог раннера: $dir${NC}"
+          echo -n -e "${RED}Удалить каталог раннера полностью? (y/n): ${NC}"
+          read del_dir
+          if [[ "$del_dir" == "y" || "$del_dir" == "Y" ]]; then
+            rm -rf "$dir"
+            echo -e "${GREEN}Каталог удалён.${NC}"
+          fi
+          echo -e "${CYAN}Примечание: чтобы убрать раннер из GitHub, удалите его в Settings → Actions → Runners${NC}"
+          echo -e "${CYAN}или заранее: cd '$dir' && ./config.sh remove --token <TOKEN>${NC}"
+          sleep 2
+          return 0
+        else
+          echo -e "${YELLOW}Удаление отменено.${NC}"
+          sleep 1
+        fi
+        ;;
+      7)
+        return 0
+        ;;
+      *)
+        echo -e "${RED}Некорректный выбор!${NC}"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+# Список установленных раннеров с выбором для управления
+manage_github_runners() {
+  while true; do
+    clear_screen
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo -e "${BOLD}${CYAN}   УПРАВЛЕНИЕ GITHUB ACTIONS РАННЕРАМИ       ${NC}"
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo ""
+
+    mapfile -t runners < <(find_github_runners)
+
+    if [ ${#runners[@]} -eq 0 ]; then
+      echo -e "${YELLOW}Установленные раннеры не найдены.${NC}"
+      echo -e "${CYAN}Сначала установите раннер (пункт «Установить новый раннер»).${NC}"
+      echo ""
+      echo -e "${YELLOW}Нажмите Enter, чтобы вернуться...${NC}"; read
+      return 0
+    fi
+
+    echo -e "${YELLOW}Найденные раннеры:${NC}"
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    local i
+    for i in "${!runners[@]}"; do
+      local d="${runners[$i]}"
+      local repo unit status_text
+      repo=$(runner_repo_name "$d")
+      unit=$(runner_service_name "$d")
+      status_text="${YELLOW}нет сервиса${NC}"
+      if [ -n "$unit" ]; then
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+          status_text="${GREEN}активен${NC}"
+        else
+          status_text="${RED}неактивен${NC}"
+        fi
+      fi
+      echo -e "${CYAN}$((i+1)).${NC} ${BOLD}$repo${NC} (${status_text})"
+      echo -e "   ${YELLOW}Каталог:${NC} $d"
+      echo -e "${YELLOW}---------------------------------------------${NC}"
+    done
+
+    echo ""
+    echo -e "${CYAN}1.${NC} Выбрать раннер для управления"
+    echo -e "${CYAN}2.${NC} Назад"
+    echo ""
+    echo -n -e "${GREEN}Ваш выбор (1-2): ${NC}"
+    read action_choice
+
+    if [ "$action_choice" = "1" ]; then
+      echo -n -e "${GREEN}Введите номер раннера: ${NC}"
+      read runner_number
+      if ! [[ "$runner_number" =~ ^[0-9]+$ ]] || [ "$runner_number" -lt 1 ] || [ "$runner_number" -gt ${#runners[@]} ]; then
+        echo -e "${RED}Некорректный выбор!${NC}"
+        sleep 2
+        continue
+      fi
+      github_runner_control "${runners[$((runner_number-1))]}"
+    elif [ "$action_choice" = "2" ]; then
+      return 0
+    else
+      echo -e "${RED}Некорректный выбор!${NC}"
+      sleep 1
+    fi
+  done
+}
+
+# Компактный список сайтов nginx: домен → проксирование [порты] (✓ — включён)
+nginx_compact_list() {
+  local dir="/etc/nginx/sites-available"
+  if [ ! -d "$dir" ]; then
+    echo -e "${YELLOW}(nginx не установлен)${NC}"
+    return 0
+  fi
+
+  local f any=0
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    local name domain target ports mark
+    name=$(basename "$f")
+
+    # Первый домен из server_name (устойчиво к inline-конфигам)
+    domain=$(grep -E "server_name" "$f" | head -1 | sed 's/.*server_name[[:space:]]*//; s/[;{}].*//' | awk '{print $1}')
+    [ -z "$domain" ] && domain="$name"
+
+    # Куда проксируется: proxy_pass или PHP-FPM (fastcgi_pass)
+    target=$(grep -E "proxy_pass" "$f" | head -1 | sed 's/.*proxy_pass[[:space:]]*//; s/[;}].*//; s/[[:space:]]*$//')
+    if [ -z "$target" ]; then
+      if grep -qE "fastcgi_pass" "$f"; then
+        target="php→$(grep -E "fastcgi_pass" "$f" | head -1 | sed 's/.*fastcgi_pass[[:space:]]*//; s/[;}].*//; s/[[:space:]]*$//; s#unix:##')"
+      fi
+    fi
+    # Укорачиваем для компактности
+    target="${target#http://}"
+    target="${target#https://}"
+    [ -z "$target" ] && target="—"
+    [ ${#target} -gt 28 ] && target="${target:0:25}..."
+
+    # Порты, на которых слушает сайт
+    ports=$(grep -oE "listen[[:space:]]+[0-9]+" "$f" | grep -oE "[0-9]+" | sort -un | tr '\n' ',' | sed 's/,$//')
+
+    # Включён ли (симлинк в sites-enabled)
+    if [ -L "/etc/nginx/sites-enabled/$name" ]; then
+      mark="${GREEN}✓${NC}"
+    else
+      mark="${YELLOW}·${NC}"
+    fi
+
+    echo -e "${mark} ${BOLD}${domain}${NC} → ${CYAN}${target}${NC} ${YELLOW}[:${ports:-?}]${NC}"
+    any=1
+  done
+
+  [ "$any" = 0 ] && echo -e "${YELLOW}(нет конфигураций)${NC}"
+  return 0
+}
+
+# Печать строки в две колонки (левая может содержать ANSI-цвета и UTF-8).
+# Ширину считаем в видимых символах: байты минус UTF-8 continuation-байты,
+# что корректно для кириллицы независимо от локали.
+print_two_col() {
+  local left="$1" right="$2" w="${3:-40}"
+  local plain bytes cont len pad
+  plain=$(printf '%b' "$left" | sed 's/\x1b\[[0-9;]*m//g')
+  bytes=$(printf '%s' "$plain" | wc -c)
+  cont=$(printf '%s' "$plain" | grep -aoP '[\x80-\xBF]' 2>/dev/null | wc -l)
+  len=$(( bytes - cont )); [ "$len" -lt 0 ] && len=0
+  pad=$(( w - len )); [ "$pad" -lt 0 ] && pad=0
+  printf '%b%*s  %b\n' "$left" "$pad" "" "$right"
+}
+
+# Подменю Nginx: создание или управление + панель текущих сайтов справа
+nginx_menu() {
+  while true; do
+    clear_screen
+
+    # Правая панель: текущие сайты
+    local RIGHT=()
+    RIGHT+=("${BOLD}${PURPLE}Текущие сайты (${GREEN}✓${PURPLE} вкл):${NC}")
+    local line
+    while IFS= read -r line; do RIGHT+=("$line"); done < <(nginx_compact_list)
+
+    # Левая панель: пункты меню
+    local LEFT=()
+    LEFT+=("${YELLOW}Выберите действие:${NC}")
+    LEFT+=("${CYAN}1.${NC} Создать конфигурацию nginx")
+    LEFT+=("${CYAN}2.${NC} Управление конфигурациями nginx")
+    LEFT+=("${CYAN}3.${NC} Назад в главное меню")
+
+    echo -e "${BOLD}${CYAN}============================================================================${NC}"
+    echo -e "${BOLD}${CYAN}                                  NGINX                                      ${NC}"
+    echo -e "${BOLD}${CYAN}============================================================================${NC}"
+    echo ""
+
+    # Выводим обе колонки построчно
+    local rows=${#LEFT[@]}
+    [ ${#RIGHT[@]} -gt "$rows" ] && rows=${#RIGHT[@]}
+    local i
+    for (( i=0; i<rows; i++ )); do
+      print_two_col "${LEFT[$i]:-}" "${RIGHT[$i]:-}" 38
+    done
+
+    echo ""
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo -n -e "${GREEN}Ваш выбор (1-3): ${NC}"
+    read nginx_choice
+
+    case $nginx_choice in
+      1) create_nginx_config ;;
+      2) manage_nginx_configs ;;
+      3) return 0 ;;
+      *) echo -e "${RED}Некорректный выбор!${NC}"; sleep 1 ;;
+    esac
+  done
+}
+
+# Подменю GitHub Actions раннеров: установка или управление
+github_runner_menu() {
+  while true; do
+    clear_screen
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo -e "${BOLD}${CYAN}        GITHUB ACTIONS RUNNER                ${NC}"
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo ""
+    echo -e "${YELLOW}Выберите действие:${NC}"
+    echo -e "${CYAN}1.${NC} Установить новый раннер"
+    echo -e "${CYAN}2.${NC} Управление установленными раннерами"
+    echo -e "${CYAN}3.${NC} Назад в главное меню"
+    echo ""
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo -n -e "${GREEN}Ваш выбор (1-3): ${NC}"
+    read gh_choice
+
+    case $gh_choice in
+      1) create_github_runner ;;
+      2) manage_github_runners ;;
+      3) return 0 ;;
+      *) echo -e "${RED}Некорректный выбор!${NC}"; sleep 1 ;;
+    esac
+  done
+}
+
 show_main_menu() {
   while true; do
     clear_screen
@@ -2375,14 +2806,14 @@ show_main_menu() {
     echo -e "${CYAN}1.${NC} Создать новый сервис"
     echo -e "${CYAN}2.${NC} Просмотреть и управлять существующими сервисами"
     echo -e "${CYAN}3.${NC} Менеджер уведомлений"
-    echo -e "${CYAN}4.${NC} Управление конфигурациями nginx"
-    echo -e "${CYAN}5.${NC} Создать конфигурацию nginx"
+    echo -e "${CYAN}4.${NC} Nginx (создание / управление)"
+    echo -e "${CYAN}5.${NC} GitHub Actions runner (установка / управление)"
     echo -e "${CYAN}6.${NC} Завершить работу скрипта"
     echo ""
     echo -e "${YELLOW}---------------------------------------------${NC}"
     echo -n -e "${GREEN}Ваш выбор (1-6): ${NC}"
     read main_choice
-    
+
     case $main_choice in
       1)
         if select_runtime; then
@@ -2398,10 +2829,10 @@ show_main_menu() {
         manage_notifications
         ;;
       4)
-        manage_nginx_configs
+        nginx_menu
         ;;
       5)
-        create_nginx_config
+        github_runner_menu
         ;;
       6)
         clear_screen
@@ -2413,7 +2844,7 @@ show_main_menu() {
         sleep 1
         ;;
     esac
-    
+
     # Пауза перед возвратом в главное меню
     if [ "$main_choice" != "6" ]; then
       echo ""

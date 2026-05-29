@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Pre-commit хук: прогоняет интеграционные тесты service.sh в Docker
+# (контейнер с настоящим systemd) ПЕРЕД каждым коммитом.
+#
+# Активируется через: git config core.hooksPath tests/githooks
+# (см. tests/install-hooks.sh).
+#
+# Пропустить разово:  SKIP_TESTS=1 git commit ...   или   git commit --no-verify
+set -euo pipefail
+
+if [ "${SKIP_TESTS:-0}" = "1" ]; then
+  echo "pre-commit: SKIP_TESTS=1 -> тесты пропущены"
+  exit 0
+fi
+
+REPO_DIR="$(git rev-parse --show-toplevel)"
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "pre-commit: docker не найден — пропуск тестов (установите Docker или используйте --no-verify)" >&2
+  exit 0
+fi
+
+echo "pre-commit: запуск тестов service.sh в Docker (systemd)…"
+if ! "$REPO_DIR/tests/test.sh"; then
+  echo
+  echo "pre-commit: ТЕСТЫ УПАЛИ — коммит отменён." >&2
+  echo "  Исправьте ошибки или закоммитьте с --no-verify (нежелательно)." >&2
+  exit 1
+fi
+
+echo "pre-commit: все тесты прошли ✅"
+exit 0
