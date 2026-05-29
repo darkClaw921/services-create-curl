@@ -2669,7 +2669,10 @@ nginx_compact_list() {
     return 0
   fi
 
+  # Первый проход — собираем поля и считаем ширину столбцов домена и target
   local f any=0
+  local -a MARKS=() DOMAINS=() TARGETS=() PORTSES=()
+  local dom_w=0 tgt_w=0
   for f in "$dir"/*; do
     [ -f "$f" ] || continue
     local name domain target ports mark
@@ -2702,11 +2705,27 @@ nginx_compact_list() {
       mark="${YELLOW}·${NC}"
     fi
 
-    echo -e "${mark} ${BOLD}${domain}${NC} → ${CYAN}${target}${NC} ${YELLOW}[:${ports:-?}]${NC}"
+    MARKS+=("$mark"); DOMAINS+=("$domain"); TARGETS+=("$target"); PORTSES+=("${ports:-?}")
+    # Ширина в видимых символах (домен/target могут быть с UTF-8, напр. «php→…»)
+    local dl tl
+    dl=$(visible_len "$domain"); [ "$dl" -gt "$dom_w" ] && dom_w="$dl"
+    tl=$(visible_len "$target"); [ "$tl" -gt "$tgt_w" ] && tgt_w="$tl"
     any=1
   done
 
-  [ "$any" = 0 ] && echo -e "${YELLOW}(нет конфигураций)${NC}"
+  [ "$any" = 0 ] && { echo -e "${YELLOW}(нет конфигураций)${NC}"; return 0; }
+
+  # Второй проход — печатаем с ровными столбцами: домен → target [порты]
+  local i dpad tpad
+  for i in "${!DOMAINS[@]}"; do
+    dpad=$(( dom_w - $(visible_len "${DOMAINS[$i]}") )); [ "$dpad" -lt 0 ] && dpad=0
+    tpad=$(( tgt_w - $(visible_len "${TARGETS[$i]}") )); [ "$tpad" -lt 0 ] && tpad=0
+    printf '%b %b%*s → %b%*s %b\n' \
+      "${MARKS[$i]}" \
+      "${BOLD}${DOMAINS[$i]}${NC}" "$dpad" "" \
+      "${CYAN}${TARGETS[$i]}${NC}" "$tpad" "" \
+      "${YELLOW}[:${PORTSES[$i]}]${NC}"
+  done
   return 0
 }
 
