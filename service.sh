@@ -2485,6 +2485,30 @@ runner_repo_name() {
   basename "$dir" | sed 's/^actions-runner-//'
 }
 
+# Запуск svc.sh раннера (с sudo, если мы не root — systemd на Linux требует прав).
+# Возвращает 2, если svc.sh в каталоге отсутствует.
+runner_svc() {
+  local dir="$1"; shift
+  [ -f "$dir/svc.sh" ] || return 2
+  if [ "$(id -u)" -eq 0 ] || ! command -v sudo >/dev/null 2>&1; then
+    ( cd "$dir" && ./svc.sh "$@" )
+  else
+    ( cd "$dir" && sudo ./svc.sh "$@" )
+  fi
+}
+
+# PID раннера, запущенного вручную (Runner.Listener) для данного каталога
+runner_manual_pid() {
+  pgrep -f -- "$1/bin/Runner.Listener" 2>/dev/null | head -1
+}
+
+# Запуск раннера в фоне через run.sh (когда сервис не используется)
+runner_run_background() {
+  local dir="$1"
+  ( cd "$dir" && nohup ./run.sh >> "$dir/runner.log" 2>&1 & )
+  sleep 1
+}
+
 # Меню управления одним раннером
 github_runner_control() {
   local dir="$1"
@@ -2498,10 +2522,14 @@ github_runner_control() {
     local status_text="${YELLOW}неизвестно${NC}"
     if [ -n "$unit" ]; then
       if systemctl is-active --quiet "$unit" 2>/dev/null; then
-        status_text="${GREEN}активен${NC}"
+        status_text="${GREEN}активен (сервис)${NC}"
       else
         status_text="${RED}неактивен${NC}"
       fi
+    elif [ -n "$(runner_manual_pid "$dir")" ]; then
+      status_text="${GREEN}активен (вручную)${NC}"
+    else
+      status_text="${YELLOW}не запущен${NC}"
     fi
 
     echo -e "${BOLD}${CYAN}==============================================${NC}"
@@ -2530,25 +2558,74 @@ github_runner_control() {
     case $runner_action in
       1)
         echo -e "${YELLOW}Запуск раннера...${NC}"
-        ( cd "$dir" && ./svc.sh start )
+        if [ -n "$unit" ]; then
+          # сервис установлен — запускаем через svc.sh
+          runner_svc "$dir" start
+        elif [ -f "$dir/svc.sh" ]; then
+          # бинарники есть, но сервис ещё не установлен — ставим и запускаем
+          echo -e "${CYAN}Сервис не установлен — устанавливаю и запускаю...${NC}"
+          if runner_svc "$dir" install "$(whoami)"; then
+            runner_svc "$dir" start
+          else
+            echo -e "${RED}Не удалось установить сервис.${NC}"
+          fi
+        elif [ -f "$dir/run.sh" ]; then
+          # svc.sh отсутствует — запускаем раннер в фоне напрямую
+          if [ -n "$(runner_manual_pid "$dir")" ]; then
+            echo -e "${GREEN}Раннер уже запущен (PID $(runner_manual_pid "$dir")).${NC}"
+          else
+            echo -e "${YELLOW}svc.sh не найден — запускаю раннер в фоне через run.sh...${NC}"
+            runner_run_background "$dir"
+            echo -e "${GREEN}Раннер запущен в фоне. Логи: ${dir}/runner.log${NC}"
+          fi
+        else
+          echo -e "${RED}В каталоге нет ни svc.sh, ни run.sh — раннер установлен некорректно. Переустановите его (пункт «Создать раннер»).${NC}"
+        fi
         echo ""
         echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
         ;;
       2)
         echo -e "${YELLOW}Остановка раннера...${NC}"
-        ( cd "$dir" && ./svc.sh stop )
+        if [ -f "$dir/svc.sh" ]; then
+          runner_svc "$dir" stop
+        else
+          local mpid; mpid="$(runner_manual_pid "$dir")"
+          if [ -n "$mpid" ]; then
+            kill "$mpid" 2>/dev/null && echo -e "${GREEN}Раннер (PID $mpid) остановлен.${NC}"
+          else
+            echo -e "${YELLOW}Запущенный раннер не найден.${NC}"
+          fi
+        fi
         echo ""
         echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
         ;;
       3)
         echo -e "${YELLOW}Перезапуск раннера...${NC}"
-        ( cd "$dir" && ./svc.sh stop && ./svc.sh start )
+        if [ -f "$dir/svc.sh" ]; then
+          runner_svc "$dir" stop && runner_svc "$dir" start
+        elif [ -f "$dir/run.sh" ]; then
+          local mpid; mpid="$(runner_manual_pid "$dir")"
+          [ -n "$mpid" ] && kill "$mpid" 2>/dev/null && sleep 1
+          runner_run_background "$dir"
+          echo -e "${GREEN}Раннер перезапущен в фоне. Логи: ${dir}/runner.log${NC}"
+        else
+          echo -e "${RED}svc.sh/run.sh не найдены — раннер установлен некорректно.${NC}"
+        fi
         echo ""
         echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
         ;;
       4)
         echo -e "${YELLOW}Статус раннера:${NC}"
-        ( cd "$dir" && ./svc.sh status )
+        if [ -f "$dir/svc.sh" ]; then
+          runner_svc "$dir" status
+        else
+          local mpid; mpid="$(runner_manual_pid "$dir")"
+          if [ -n "$mpid" ]; then
+            echo -e "${GREEN}Раннер запущен вручную (PID $mpid).${NC}"
+          else
+            echo -e "${YELLOW}Раннер не запущен (нет ни сервиса, ни процесса).${NC}"
+          fi
+        fi
         echo ""
         echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
         ;;
@@ -2566,7 +2643,12 @@ github_runner_control() {
         read confirm_del
         if [[ "$confirm_del" == "y" || "$confirm_del" == "Y" ]]; then
           echo -e "${YELLOW}Остановка и отвязка сервиса...${NC}"
-          ( cd "$dir" && ./svc.sh stop 2>/dev/null; ./svc.sh uninstall 2>/dev/null )
+          if [ -f "$dir/svc.sh" ]; then
+            runner_svc "$dir" stop 2>/dev/null
+            runner_svc "$dir" uninstall 2>/dev/null
+          fi
+          local mpid; mpid="$(runner_manual_pid "$dir")"
+          [ -n "$mpid" ] && kill "$mpid" 2>/dev/null
           echo -e "${GREEN}Сервис раннера отвязан.${NC}"
           echo ""
           echo -e "${YELLOW}Каталог раннера: $dir${NC}"
