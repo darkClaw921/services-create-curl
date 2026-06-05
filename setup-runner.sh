@@ -107,16 +107,17 @@ cd "$RUNNER_DIR"
 TARBALL="actions-runner-${OS}-${ARCH}-${VERSION}.${PKG}"
 URL="https://github.com/actions/runner/releases/download/v${VERSION}/${TARBALL}"
 
-# Считаем распаковку полной только если на месте ВСЕ ключевые скрипты,
-# иначе (например, прерванная/битая распаковка) — качаем и распаковываем заново.
-if [[ ! -f "./config.sh" || ! -f "./svc.sh" || ! -f "./run.sh" ]]; then
+# Считаем распаковку полной, если на месте ключевые файлы из архива.
+# ВАЖНО: svc.sh в архиве НЕТ — его создаёт config.sh при конфигурации,
+# поэтому здесь его проверять нельзя (иначе любая установка «упадёт»).
+if [[ ! -f "./config.sh" || ! -f "./run.sh" ]]; then
   echo "==> скачиваю $URL"
   curl -fsSL -o "$TARBALL" "$URL" || die "не удалось скачать раннер с $URL"
   echo "==> распаковываю…"
   tar xzf "$TARBALL" || die "не удалось распаковать $TARBALL (повреждён?) — удалите $RUNNER_DIR и повторите"
   rm -f "$TARBALL"
   # проверяем, что распаковка действительно дала рабочий комплект
-  for f in config.sh svc.sh run.sh; do
+  for f in config.sh run.sh; do
     [[ -f "./$f" ]] || die "после распаковки нет ./$f — архив повреждён, удалите $RUNNER_DIR и повторите"
   done
 else
@@ -124,6 +125,10 @@ else
 fi
 
 # ---- configure (non-interactive) ----
+# config.sh (и run.sh) раннера отказываются работать под root без этой переменной
+# (выдают «Must not run with sudo» и выходят). Переменная влияет только при uid=0,
+# для обычного пользователя безвредна. Сам сервис под systemd работает штатно.
+export RUNNER_ALLOW_RUNASROOT=1
 echo "==> конфигурирую раннер…"
 ./config.sh \
   --unattended \
