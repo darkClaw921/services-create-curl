@@ -2502,11 +2502,13 @@ runner_manual_pid() {
   pgrep -f -- "$1/bin/Runner.Listener" 2>/dev/null | head -1
 }
 
-# Запуск раннера в фоне через run.sh (когда сервис не используется)
+# Запуск раннера в фоне через run.sh (когда сервис не используется).
+# RUNNER_ALLOW_RUNASROOT=1 — иначе раннер откажется стартовать под root;
+# </dev/null — чтобы он не считал запуск интерактивным («Must not run interactively with sudo»).
 runner_run_background() {
   local dir="$1"
-  ( cd "$dir" && nohup ./run.sh >> "$dir/runner.log" 2>&1 & )
-  sleep 1
+  ( cd "$dir" && RUNNER_ALLOW_RUNASROOT=1 nohup ./run.sh < /dev/null >> "$dir/runner.log" 2>&1 & )
+  sleep 2
 }
 
 # Меню управления одним раннером
@@ -2576,7 +2578,14 @@ github_runner_control() {
           else
             echo -e "${YELLOW}svc.sh не найден — запускаю раннер в фоне через run.sh...${NC}"
             runner_run_background "$dir"
-            echo -e "${GREEN}Раннер запущен в фоне. Логи: ${dir}/runner.log${NC}"
+            local mpid; mpid="$(runner_manual_pid "$dir")"
+            if [ -n "$mpid" ]; then
+              echo -e "${GREEN}Раннер запущен в фоне (PID $mpid). Логи: ${dir}/runner.log${NC}"
+            else
+              echo -e "${RED}Раннер не запустился. Последние строки лога:${NC}"
+              tail -n 8 "$dir/runner.log" 2>/dev/null
+              echo -e "${YELLOW}Нет svc.sh для установки сервиса — восстановите бинарники раннера (переустановка) или см. инструкцию ниже.${NC}"
+            fi
           fi
         else
           echo -e "${RED}В каталоге нет ни svc.sh, ни run.sh — раннер установлен некорректно. Переустановите его (пункт «Создать раннер»).${NC}"

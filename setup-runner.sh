@@ -107,12 +107,18 @@ cd "$RUNNER_DIR"
 TARBALL="actions-runner-${OS}-${ARCH}-${VERSION}.${PKG}"
 URL="https://github.com/actions/runner/releases/download/v${VERSION}/${TARBALL}"
 
-if [[ ! -f "./config.sh" ]]; then
+# Считаем распаковку полной только если на месте ВСЕ ключевые скрипты,
+# иначе (например, прерванная/битая распаковка) — качаем и распаковываем заново.
+if [[ ! -f "./config.sh" || ! -f "./svc.sh" || ! -f "./run.sh" ]]; then
   echo "==> скачиваю $URL"
   curl -fsSL -o "$TARBALL" "$URL" || die "не удалось скачать раннер с $URL"
   echo "==> распаковываю…"
-  tar xzf "$TARBALL"
+  tar xzf "$TARBALL" || die "не удалось распаковать $TARBALL (повреждён?) — удалите $RUNNER_DIR и повторите"
   rm -f "$TARBALL"
+  # проверяем, что распаковка действительно дала рабочий комплект
+  for f in config.sh svc.sh run.sh; do
+    [[ -f "./$f" ]] || die "после распаковки нет ./$f — архив повреждён, удалите $RUNNER_DIR и повторите"
+  done
 else
   echo "==> бинарники уже распакованы, пропускаю скачивание"
 fi
