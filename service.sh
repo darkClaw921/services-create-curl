@@ -258,90 +258,150 @@ select_runtime() {
   return 0
 }
 
-# Функция для выбора файла из текущей директории
+# Функция для выбора файла запуска с навигацией по папкам.
+# Рабочая директория сервиса остаётся местом запуска скрипта ($(pwd)) — здесь
+# мы НЕ меняем реальный pwd, а ходим по дереву через переменную browse_dir.
+# Результат:
+#   selected_file       — имя файла (для имени сервиса)
+#   selected_file_path  — абсолютный путь к выбранному файлу
 select_file() {
-  clear_screen
-  echo -e "${BOLD}${CYAN}==============================================${NC}"
-  echo -e "${BOLD}${CYAN}              ВЫБОР ФАЙЛА                    ${NC}"
-  echo -e "${BOLD}${CYAN}==============================================${NC}"
-  echo ""
-  echo -e "${YELLOW}Доступные файлы в текущей директории:${NC}"
-  echo ""
-  
-  # Получаем список файлов
-  files=($(ls -p | grep -v /))
-  
-  if [ ${#files[@]} -eq 0 ]; then
-    echo -e "${RED}В текущей директории нет файлов.${NC}"
-    sleep 2
-    return 1
-  fi
-  
-  # Выводим список файлов с номерами
-  for i in "${!files[@]}"; do
-    echo -e "${CYAN}$((i+1)).${NC} ${files[$i]}"
+  local browse_dir
+  browse_dir="$(pwd)"
+
+  while true; do
+    clear_screen
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo -e "${BOLD}${CYAN}              ВЫБОР ФАЙЛА                    ${NC}"
+    echo -e "${BOLD}${CYAN}==============================================${NC}"
+    echo ""
+    echo -e "${YELLOW}Текущая папка:${NC} ${BOLD}$browse_dir${NC}"
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+
+    # Собираем списки папок и файлов из browse_dir (без смены реального pwd)
+    local dirs=() files=()
+    local entry
+    while IFS= read -r entry; do
+      [ -n "$entry" ] && dirs+=("${entry%/}")
+    done < <(cd "$browse_dir" 2>/dev/null && ls -d */ 2>/dev/null)
+    while IFS= read -r entry; do
+      [ -n "$entry" ] && files+=("$entry")
+    done < <(cd "$browse_dir" 2>/dev/null && ls -p 2>/dev/null | grep -v /)
+
+    # Пункт подъёма на уровень вверх (если не в корне ФС)
+    if [ "$browse_dir" != "/" ]; then
+      echo -e "${CYAN}0.${NC} ${BOLD}..${NC} (на уровень вверх)"
+    fi
+
+    # Папки
+    local idx=1
+    for entry in "${dirs[@]}"; do
+      echo -e "${CYAN}${idx}.${NC} ${BLUE}[папка]${NC} ${entry}/"
+      idx=$((idx+1))
+    done
+
+    # Файлы (нумерация продолжается после папок)
+    for entry in "${files[@]}"; do
+      echo -e "${CYAN}${idx}.${NC} ${entry}"
+      idx=$((idx+1))
+    done
+
+    if [ ${#dirs[@]} -eq 0 ] && [ ${#files[@]} -eq 0 ]; then
+      echo -e "${RED}В этой папке нет файлов и подпапок.${NC}"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}---------------------------------------------${NC}"
+    echo -e "${YELLOW}Введите номер папки (зайти) или файла (выбрать), 0 — вверх, q — отмена.${NC}"
+    echo -n -e "${GREEN}Ваш выбор: ${NC}"
+    # При недоступном вводе (EOF/закрытый stdin) аккуратно выходим, а не зацикливаемся
+    if ! read choice; then
+      echo -e "${YELLOW}Ввод недоступен — выбор файла отменён.${NC}"
+      return 1
+    fi
+
+    # Отмена
+    if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
+      echo -e "${YELLOW}Выбор файла отменён.${NC}"
+      sleep 1
+      return 1
+    fi
+
+    # Подъём вверх
+    if [ "$choice" == "0" ] && [ "$browse_dir" != "/" ]; then
+      browse_dir="$(cd "$browse_dir/.." 2>/dev/null && pwd)"
+      continue
+    fi
+
+    # Проверяем, что введено число в допустимом диапазоне
+    local total=$(( ${#dirs[@]} + ${#files[@]} ))
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$total" ]; then
+      echo -e "${RED}Некорректный выбор!${NC}"
+      sleep 2
+      continue
+    fi
+
+    if [ "$choice" -le "${#dirs[@]}" ]; then
+      # Выбрана папка — заходим внутрь
+      local chosen_dir="${dirs[$((choice-1))]}"
+      browse_dir="$(cd "$browse_dir/$chosen_dir" 2>/dev/null && pwd)"
+      continue
+    fi
+
+    # Выбран файл
+    local file_index=$(( choice - ${#dirs[@]} - 1 ))
+    selected_file="${files[$file_index]}"
+    selected_file_path="$browse_dir/$selected_file"
+    echo -e "${GREEN}Выбран файл: ${BOLD}$selected_file_path${NC}"
+
+    # Проверяем, что файл исполняемый, если нет - делаем его исполняемым
+    if [ ! -x "$selected_file_path" ]; then
+      echo -e "${YELLOW}Файл не является исполняемым. Делаем его исполняемым...${NC}"
+      chmod +x "$selected_file_path"
+    fi
+
+    sleep 1
+    return 0
   done
-  
-  echo ""
-  echo -e "${YELLOW}---------------------------------------------${NC}"
-  echo -n -e "${GREEN}Выберите номер файла для создания сервиса: ${NC}"
-  read choice
-  
-  # Проверяем корректность ввода
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#files[@]} ]; then
-    echo -e "${RED}Некорректный выбор!${NC}"
-    sleep 2
-    return 1
-  fi
-  
-  selected_file="${files[$((choice-1))]}"
-  echo -e "${GREEN}Выбран файл: ${BOLD}$selected_file${NC}"
-  
-  # Проверяем, что файл исполняемый, если нет - делаем его исполняемым
-  if [ ! -x "$selected_file" ]; then
-    echo -e "${YELLOW}Файл не является исполняемым. Делаем его исполняемым...${NC}"
-    chmod +x "$selected_file"
-  fi
-  
-  sleep 1
-  return 0
 }
 
 # Функция для создания и установки systemd сервиса
 create_service() {
   clear_screen
-  local file="$1"
+  local file_path="$1"                      # абсолютный путь к файлу запуска
   local runtime="$2"
-  local abs_path="$(pwd)/$file"
-  local service_name="${file%.*}"
+  local file_name="$(basename "$file_path")"
+  local service_name="${file_name%.*}"
+  local work_dir="$(pwd)"                    # рабочая директория = место запуска скрипта
   local exec_command=""
-  
+
   echo -e "${BOLD}${CYAN}==============================================${NC}"
   echo -e "${BOLD}${CYAN}           СОЗДАНИЕ СЕРВИСА                  ${NC}"
   echo -e "${BOLD}${CYAN}==============================================${NC}"
   echo ""
-  
-  # Определяем команду запуска в зависимости от выбранного режима
+
+  # Определяем команду запуска в зависимости от выбранного режима.
+  # Используем абсолютный путь к файлу, т.к. он может лежать во вложенной папке,
+  # а рабочая директория сервиса остаётся местом запуска скрипта.
   if [ "$runtime" == "python" ]; then
     # Получаем полный путь к python3
     python_path=$(which python3)
-    exec_command="$python_path $file"
+    exec_command="$python_path \"$file_path\""
   elif [ "$runtime" == "uv" ]; then
     # Получаем полный путь к uv
     uv_path=$(which uv)
-    exec_command="$uv_path run $file"
+    exec_command="$uv_path run \"$file_path\""
   elif [ "$runtime" == "php" ]; then
     # Получаем полный путь к php
     php_path=$(which php)
-    exec_command="$php_path -S $php_host_port $file"
+    exec_command="$php_path -S $php_host_port \"$file_path\""
   elif [ "$runtime" == "shell" ]; then
     # Получаем полный путь к bash
     bash_path=$(which bash)
-    exec_command="$bash_path $file"
+    exec_command="$bash_path \"$file_path\""
   elif [ "$runtime" == "poetry" ]; then
     # Получаем полный путь к poetry
     poetry_path=$(which poetry)
-    exec_command="$poetry_path run python $file"
+    exec_command="$poetry_path run python \"$file_path\""
   fi
   
   # Запрашиваем описание сервиса
@@ -423,13 +483,13 @@ EOF
   # Создаем service файл
   cat > "/etc/systemd/system/${service_name}.service" << EOF
 [Unit]
-Description=${description:-"Service for $file"}
+Description=${description:-"Service for $file_name"}
 After=network.target
 
 [Service]
 Type=simple
 User=${USER}
-WorkingDirectory=$(pwd)
+WorkingDirectory=${work_dir}
 ExecStart=${exec_command}
 ExecStartPost=${notification_script} "запущен"
 ExecStop=${notification_script} "остановлен"
@@ -445,10 +505,12 @@ EOF
 
   echo ""
   echo -e "${GREEN}Сервисный файл создан: ${BOLD}/etc/systemd/system/${service_name}.service${NC}"
+  echo -e "${BLUE}Рабочая директория:${NC} ${work_dir}"
+  echo -e "${BLUE}Файл запуска:${NC} ${file_path}"
   echo -e "${BLUE}Команда запуска:${NC} ${exec_command}"
-  
+
   # Добавляем запись о созданном сервисе
-  echo "${service_name}.service:$(pwd):$(date '+%Y-%m-%d %H:%M:%S')" >> "$SERVICES_LIST_FILE"
+  echo "${service_name}.service:${work_dir}:$(date '+%Y-%m-%d %H:%M:%S')" >> "$SERVICES_LIST_FILE"
   
   # Перезагружаем конфигурацию systemd
   echo -e "${YELLOW}Перезагрузка конфигурации systemd...${NC}"
@@ -2959,7 +3021,7 @@ show_main_menu() {
       1)
         if select_runtime; then
           if select_file; then
-            create_service "$selected_file" "$runtime_type"
+            create_service "$selected_file_path" "$runtime_type"
           fi
         fi
         ;;

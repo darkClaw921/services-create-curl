@@ -127,20 +127,24 @@ echo "$out" | grep -q 'RC=0' && ok "Shell (5) -> RC=0" || bad "select shell" "$o
 # =====================================================================
 section "6. create_service: генерация unit-файла (без запуска)"
 # =====================================================================
+# 3-й аргумент — ПРЕФИКС команды (рантайм + флаги) без файла; абсолютный путь к
+# файлу в кавычках добавляется автоматически (как формирует create_service).
 test_create_service() {
-  local runtime="$1" file="$2" expect_exec="$3" extra_setup="$4"
+  local runtime="$1" file="$2" exec_prefix="$3" extra_setup="$4"
   reset_fs
   call_fn init_services_list >/dev/null
   local proj=/tmp/proj_$runtime
   rm -rf "$proj"; mkdir -p "$proj"
   echo "print('hi')" > "$proj/$file"
   eval "$extra_setup"
+  # create_service получает АБСОЛЮТНЫЙ путь к файлу (как из select_file)
+  local expect_exec="$exec_prefix \"$proj/$file\""
   # description, затем "запустить сейчас?" -> n (только генерация)
-  ( cd "$proj"; printf 'Desc %s\nn\n' "$runtime" | bash -c "source /tmp/svc.sh >/dev/null 2>&1; ${PHP_GLOBAL:+$PHP_GLOBAL; }create_service '$file' '$runtime'" ) >/dev/null 2>&1
+  ( cd "$proj"; printf 'Desc %s\nn\n' "$runtime" | bash -c "source /tmp/svc.sh >/dev/null 2>&1; ${PHP_GLOBAL:+$PHP_GLOBAL; }create_service '$proj/$file' '$runtime'" ) >/dev/null 2>&1
   local svc="/etc/systemd/system/${file%.*}.service"
   if [ -f "$svc" ]; then
-    grep -q "ExecStart=${expect_exec}" "$svc" && ok "create_service[$runtime]: ExecStart" || bad "create_service[$runtime] ExecStart" "$(grep ExecStart "$svc")"
-    grep -q "WorkingDirectory=$proj" "$svc" && ok "create_service[$runtime]: WorkingDirectory" || bad "create_service[$runtime] WorkingDirectory"
+    grep -qF "ExecStart=${expect_exec}" "$svc" && ok "create_service[$runtime]: ExecStart (абс. путь, в кавычках)" || bad "create_service[$runtime] ExecStart" "$(grep ExecStart "$svc")"
+    grep -q "WorkingDirectory=$proj\$" "$svc" && ok "create_service[$runtime]: WorkingDirectory" || bad "create_service[$runtime] WorkingDirectory" "$(grep WorkingDirectory "$svc")"
     grep -q "Description=Desc $runtime" "$svc" && ok "create_service[$runtime]: Description" || bad "create_service[$runtime] Description"
     [ -f "/var/lib/service-creator/notifications/${file%.*}_notify.sh" ] && ok "create_service[$runtime]: notify-скрипт" || bad "create_service[$runtime] notify"
     grep -q "^${file%.*}.service:$proj:" /var/lib/service-creator/created_services.list && ok "create_service[$runtime]: запись в списке" || bad "create_service[$runtime] список"
@@ -151,12 +155,12 @@ test_create_service() {
   rm -f "$svc"; systemctl daemon-reload 2>/dev/null || true
   unset PHP_GLOBAL
 }
-test_create_service python  app.py  "$(command -v python3) app.py"           ""
-test_create_service uv      app.py  "$(command -v uv) run app.py"            ""
-test_create_service shell   run.sh  "$(command -v bash) run.sh"              ""
-test_create_service poetry  app.py  "$(command -v poetry) run python app.py" "touch \$proj/pyproject.toml"
+test_create_service python  app.py  "$(command -v python3)"               ""
+test_create_service uv      app.py  "$(command -v uv) run"                ""
+test_create_service shell   run.sh  "$(command -v bash)"                  ""
+test_create_service poetry  app.py  "$(command -v poetry) run python"     "touch \$proj/pyproject.toml"
 PHP_GLOBAL='php_host_port=localhost:9000'
-test_create_service php      idx.php "$(command -v php) -S localhost:9000 idx.php" ""
+test_create_service php      idx.php "$(command -v php) -S localhost:9000" ""
 
 # =====================================================================
 section "7. service_control: удаление затрагивает ТОЛЬКО один сервис"
@@ -395,7 +399,7 @@ printf '#!/usr/bin/env bash\nwhile true; do sleep 1; done\n' > "$PROJ/longrun.sh
 chmod +x "$PROJ/longrun.sh"
 
 # Создаём и СРАЗУ запускаем (ответ y)
-( cd "$PROJ"; printf 'Real lifecycle\ny\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; create_service longrun.sh shell" ) >/dev/null 2>&1
+( cd "$PROJ"; printf 'Real lifecycle\ny\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; create_service $PROJ/longrun.sh shell" ) >/dev/null 2>&1
 sleep 1 2>/dev/null || /bin/sleep 1
 [ -f /etc/systemd/system/longrun.service ] && ok "lifecycle: unit-файл создан" || bad "lifecycle: нет unit"
 [ "$(systemctl is-active longrun 2>/dev/null)" = "active" ] && ok "lifecycle: сервис РЕАЛЬНО active после старта" || bad "lifecycle: не active" "$(systemctl status longrun --no-pager 2>&1 | head -5)"
@@ -474,6 +478,107 @@ printf '6\ny\ny\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; github_runner_
 grep -q 'svc uninstall' "$SVC_LOG" && ok "control: удаление вызывает svc.sh uninstall" || bad "control uninstall" "$(cat "$SVC_LOG")"
 [ -d /home/u1/actions-runner-other ] && ok "control: соседний раннер не тронут" || bad "control delete сосед"
 rm -rf /home/u1 2>/dev/null || true
+
+# =====================================================================
+section "15. Выбор файла во вложенной папке: навигация select_file + абсолютный путь"
+# =====================================================================
+# Хелпер: запускает select_file в каталоге base с заданным вводом и печатает одну
+# строку RC|FILE|PATH. stdin подаётся here-string (без pipe-сабшелла), поэтому
+# глобальные selected_file/selected_file_path не теряются.
+run_select_file() {
+  local base="$1" input="$2"
+  ( cd "$base"
+    source /tmp/svc.sh >/dev/null 2>&1
+    select_file <<< "$(printf '%b' "$input")" >/dev/null 2>&1
+    # При отмене глобалы могут быть не установлены — :- для set -u
+    printf 'RC=%s|FILE=%s|PATH=%s\n' "$?" "${selected_file:-}" "${selected_file_path:-}"
+  )
+}
+
+# Дерево: NAV/{inner/{deep/, launch.py}, top.sh}
+NAV=/tmp/navtest; rm -rf "$NAV"; mkdir -p "$NAV/inner/deep"
+echo "print('x')" > "$NAV/inner/launch.py"
+echo "echo hi"    > "$NAV/top.sh"
+
+# (a) Заход в подпапку (1=inner) и выбор вложенного файла (2=launch.py)
+res=$(run_select_file "$NAV" '1\n2\n')
+echo "$res" | grep -q 'RC=0' && echo "$res" | grep -q "PATH=$NAV/inner/launch.py" && echo "$res" | grep -q 'FILE=launch.py' \
+  && ok "select_file: заход в inner -> выбор launch.py (абс. путь)" || bad "select_file nested" "$res"
+
+# (b) Подъём через 0 (..): inner -> вверх -> top.sh в корне
+res=$(run_select_file "$NAV" '1\n0\n2\n')
+echo "$res" | grep -q "PATH=$NAV/top.sh" && ok "select_file: '0' поднимается на уровень вверх" || bad "select_file up" "$res"
+
+# (c) Отмена через q -> RC=1
+res=$(run_select_file "$NAV" 'q\n')
+echo "$res" | grep -q 'RC=1' && ok "select_file: 'q' -> отмена (RC=1)" || bad "select_file cancel" "$res"
+
+# (d) Некорректный ввод (вне диапазона/буквы) -> переспрос, затем валидный выбор
+res=$(run_select_file "$NAV" '99\nxyz\n2\n')
+echo "$res" | grep -q 'RC=0' && echo "$res" | grep -q "PATH=$NAV/top.sh" \
+  && ok "select_file: некорректный ввод переспрашивает, затем выбирает" || bad "select_file invalid-retry" "$res"
+
+# (e) Выбор делает файл исполняемым (chmod +x)
+chmod 644 "$NAV/inner/launch.py"
+run_select_file "$NAV" '1\n2\n' >/dev/null
+[ -x "$NAV/inner/launch.py" ] && ok "select_file: выбранный файл стал исполняемым" || bad "select_file chmod"
+
+# (f) EOF на stdin -> аккуратная отмена (RC=1), без зависания
+res=$( ( cd "$NAV"; source /tmp/svc.sh >/dev/null 2>&1; select_file </dev/null >/dev/null 2>&1; echo "RC=$?" ) )
+echo "$res" | grep -q 'RC=1' && ok "select_file: EOF на вводе -> RC=1 (без зависания)" || bad "select_file eof" "$res"
+
+# (g) Пробелы в пути к папке и файлу
+SPC="/tmp/space nav"; rm -rf "$SPC"; mkdir -p "$SPC/sub dir"
+echo "echo hi" > "$SPC/sub dir/my file.sh"
+res=$(run_select_file "$SPC" '1\n1\n')
+echo "$res" | grep -q "PATH=$SPC/sub dir/my file.sh" && ok "select_file: пробелы в пути обрабатываются" || bad "select_file spaces" "$res"
+
+# (h) КЛЮЧЕВОЙ сценарий: рабочая директория = КОРЕНЬ, файл во вложенной папке
+reset_fs; call_fn init_services_list >/dev/null
+NROOT=/tmp/nested_root; rm -rf "$NROOT"; mkdir -p "$NROOT/inner"
+echo "print('hi')" > "$NROOT/inner/launch.py"
+rm -f /etc/systemd/system/launch.service
+( cd "$NROOT"; printf 'Nested run\nn\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; create_service '$NROOT/inner/launch.py' python" ) >/dev/null 2>&1
+NSVC=/etc/systemd/system/launch.service
+if [ -f "$NSVC" ]; then
+  grep -q "WorkingDirectory=$NROOT\$" "$NSVC" && ok "nested: WorkingDirectory = КОРЕНЬ (не подпапка)" || bad "nested WorkingDirectory" "$(grep WorkingDirectory "$NSVC")"
+  grep -qF "ExecStart=$(command -v python3) \"$NROOT/inner/launch.py\"" "$NSVC" && ok "nested: ExecStart -> абс. путь к файлу в подпапке" || bad "nested ExecStart" "$(grep ExecStart "$NSVC")"
+  grep -q "^launch.service:$NROOT:" /var/lib/service-creator/created_services.list && ok "nested: в списке записан корень как путь" || bad "nested список" "$(cat /var/lib/service-creator/created_services.list)"
+else bad "nested: unit-файл не создан"; fi
+systemctl disable launch.service 2>/dev/null || true
+rm -f "$NSVC"; systemctl daemon-reload 2>/dev/null || true
+
+# (i) Пробелы в пути при генерации unit-файла -> ExecStart закавычен
+reset_fs; call_fn init_services_list >/dev/null
+SROOT="/tmp/space proj"; rm -rf "$SROOT"; mkdir -p "$SROOT/sub"
+echo "print('x')" > "$SROOT/sub/launch.py"
+rm -f /etc/systemd/system/launch.service
+( cd "$SROOT"; printf 'Spaces\nn\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; create_service \"$SROOT/sub/launch.py\" python" ) >/dev/null 2>&1
+SSVC=/etc/systemd/system/launch.service
+if [ -f "$SSVC" ]; then
+  grep -qF "WorkingDirectory=$SROOT" "$SSVC" && ok "spaces: WorkingDirectory с пробелами" || bad "spaces WorkingDirectory" "$(grep WorkingDirectory "$SSVC")"
+  grep -qF "ExecStart=$(command -v python3) \"$SROOT/sub/launch.py\"" "$SSVC" && ok "spaces: ExecStart с закавыченным путём" || bad "spaces ExecStart" "$(grep ExecStart "$SSVC")"
+else bad "spaces: unit-файл не создан"; fi
+systemctl disable launch.service 2>/dev/null || true
+rm -f "$SSVC"; systemctl daemon-reload 2>/dev/null || true
+
+# (j) Интеграция: select_file -> create_service единым потоком
+reset_fs; call_fn init_services_list >/dev/null
+INTG=/tmp/integ; rm -rf "$INTG"; mkdir -p "$INTG/inner"
+echo "print('hi')" > "$INTG/inner/launch.py"
+rm -f /etc/systemd/system/launch.service
+( cd "$INTG"
+  source /tmp/svc.sh >/dev/null 2>&1
+  select_file <<< "$(printf '1\n1\n')" >/dev/null 2>&1   # inner -> launch.py
+  printf 'Integ\nn\n' | create_service "$selected_file_path" python >/dev/null 2>&1
+)
+ISVC=/etc/systemd/system/launch.service
+if [ -f "$ISVC" ]; then
+  grep -q "WorkingDirectory=$INTG\$" "$ISVC" && ok "integ: WorkingDirectory = место запуска" || bad "integ WorkingDirectory" "$(grep WorkingDirectory "$ISVC")"
+  grep -qF "ExecStart=$(command -v python3) \"$INTG/inner/launch.py\"" "$ISVC" && ok "integ: ExecStart из выбранного select_file файла" || bad "integ ExecStart" "$(grep ExecStart "$ISVC")"
+else bad "integ: unit-файл не создан"; fi
+systemctl disable launch.service 2>/dev/null || true
+rm -f "$ISVC"; systemctl daemon-reload 2>/dev/null || true
 
 # =====================================================================
 echo
