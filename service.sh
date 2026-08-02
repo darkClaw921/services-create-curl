@@ -2573,6 +2573,96 @@ runner_run_background() {
   sleep 2
 }
 
+# Раннер сконфигурирован? .runner создаётся config.sh; без него run.sh падает
+# с «Not configured» и svc.sh вообще не существует (его тоже создаёт config.sh).
+runner_is_configured() {
+  [ -f "$1/.runner" ]
+}
+
+# Конфигурация (или переконфигурация) раннера: спрашивает owner/repo и одноразовый
+# registration token, запускает config.sh --unattended и ставит сервис.
+runner_configure() {
+  local dir="$1"
+  local repo token labels name default_repo
+
+  if [ ! -f "$dir/config.sh" ]; then
+    echo -e "${RED}В каталоге нет config.sh — бинарники раннера отсутствуют.${NC}"
+    echo -e "${YELLOW}Переустановите раннер (пункт «Установить новый раннер»).${NC}"
+    return 1
+  fi
+
+  default_repo=$(runner_repo_name "$dir")
+  [[ "$default_repo" == */* ]] || default_repo=""
+
+  echo ""
+  echo -e "${YELLOW}Конфигурация раннера — нужен одноразовый registration token.${NC}"
+  echo -e "${CYAN}GitHub → репо → Settings → Actions → Runners → New self-hosted runner${NC}"
+  echo -e "${CYAN}Токен действует ~1 час и сгорает после использования.${NC}"
+  echo ""
+  if [ -n "$default_repo" ]; then
+    echo -n -e "${GREEN}Репозиторий owner/repo [${default_repo}]: ${NC}"
+  else
+    echo -n -e "${GREEN}Репозиторий owner/repo (например user/$(basename "$dir" | sed 's/^actions-runner-//')): ${NC}"
+  fi
+  read -r repo
+  [ -z "$repo" ] && repo="$default_repo"
+  if ! [[ "$repo" =~ ^[^/]+/[^/]+$ ]]; then
+    echo -e "${RED}Некорректный формат репозитория. Нужно owner/repo.${NC}"
+    return 1
+  fi
+
+  echo -n -e "${GREEN}Registration token: ${NC}"
+  read -r token
+  if [ -z "$token" ]; then
+    echo -e "${RED}Токен не указан — конфигурация отменена.${NC}"
+    return 1
+  fi
+
+  echo -n -e "${GREEN}Лейблы через запятую [self-hosted]: ${NC}"
+  read -r labels
+  [ -z "$labels" ] && labels="self-hosted"
+
+  name="$(basename "$dir" | sed 's/^actions-runner-//')-$(hostname -s 2>/dev/null || hostname)"
+
+  echo ""
+  echo -e "${YELLOW}Запускаю config.sh...${NC}"
+  # RUNNER_ALLOW_RUNASROOT=1 — под root config.sh иначе откажется работать
+  if ! ( cd "$dir" && RUNNER_ALLOW_RUNASROOT=1 ./config.sh \
+           --unattended \
+           --url "https://github.com/$repo" \
+           --token "$token" \
+           --name "$name" \
+           --labels "$labels" \
+           --work "_work" \
+           --replace ); then
+    echo -e "${RED}config.sh завершился с ошибкой — раннер не зарегистрирован.${NC}"
+    echo -e "${YELLOW}Частые причины: токен просрочен/уже использован, нет доступа в сеть,${NC}"
+    echo -e "${YELLOW}или указан не тот репозиторий. Возьмите новый токен и повторите.${NC}"
+    return 1
+  fi
+
+  if ! runner_is_configured "$dir"; then
+    echo -e "${RED}config.sh отработал, но файл .runner не создан — конфигурация не завершена.${NC}"
+    return 1
+  fi
+
+  echo -e "${GREEN}Раннер сконфигурирован для ${repo}.${NC}"
+
+  # svc.sh появляется только после успешной конфигурации — сразу ставим сервис
+  if [ -f "$dir/svc.sh" ]; then
+    echo -e "${YELLOW}Устанавливаю сервис...${NC}"
+    if runner_svc "$dir" install "$(whoami)"; then
+      runner_svc "$dir" start
+      runner_svc "$dir" status || true
+    else
+      echo -e "${YELLOW}Сервис установить не удалось — раннер можно запустить вручную (пункт 1).${NC}"
+    fi
+  else
+    echo -e "${YELLOW}svc.sh не появился — запустите раннер вручную (пункт 1).${NC}"
+  fi
+  return 0
+}
+
 # Меню управления одним раннером
 github_runner_control() {
   local dir="$1"
@@ -2600,11 +2690,22 @@ github_runner_control() {
     echo -e "${BOLD}${CYAN}   УПРАВЛЕНИЕ РАННЕРОМ                        ${NC}"
     echo -e "${BOLD}${CYAN}==============================================${NC}"
     echo ""
+    local config_text="${GREEN}сконфигурирован${NC}"
+    if ! runner_is_configured "$dir"; then
+      config_text="${RED}НЕ сконфигурирован (нет .runner)${NC}"
+    fi
+
     echo -e "${BOLD}Репозиторий:${NC} $repo"
     echo -e "${BOLD}Каталог:${NC} $dir"
+    echo -e "${BOLD}Конфигурация:${NC} $config_text"
     echo -e "${BOLD}Сервис:${NC} ${unit:-${YELLOW}не установлен как сервис${NC}}"
     echo -e "${BOLD}Статус:${NC} $status_text"
     echo -e "${YELLOW}---------------------------------------------${NC}"
+    if ! runner_is_configured "$dir"; then
+      echo ""
+      echo -e "${YELLOW}Раннер скачан, но не зарегистрирован в GitHub: запуск невозможен.${NC}"
+      echo -e "${YELLOW}Выполните пункт 7 — конфигурация с новым registration token.${NC}"
+    fi
     echo ""
     echo -e "${YELLOW}Выберите действие:${NC}"
     echo -e "${CYAN}1.${NC} Запустить раннер"
@@ -2613,14 +2714,26 @@ github_runner_control() {
     echo -e "${CYAN}4.${NC} Статус раннера"
     echo -e "${CYAN}5.${NC} Просмотреть логи"
     echo -e "${CYAN}6.${NC} Удалить раннер (отвязать сервис)"
-    echo -e "${CYAN}7.${NC} Назад к списку раннеров"
+    echo -e "${CYAN}7.${NC} Сконфигурировать раннер (ввести registration token)"
+    echo -e "${CYAN}8.${NC} Назад к списку раннеров"
     echo ""
     echo -e "${YELLOW}---------------------------------------------${NC}"
-    echo -n -e "${GREEN}Ваш выбор (1-7): ${NC}"
+    echo -n -e "${GREEN}Ваш выбор (1-8): ${NC}"
     read runner_action
 
     case $runner_action in
       1)
+        if ! runner_is_configured "$dir"; then
+          echo -e "${RED}Раннер не сконфигурирован — run.sh откажется стартовать («Not configured»).${NC}"
+          echo -n -e "${GREEN}Сконфигурировать сейчас? (y/n): ${NC}"
+          read -r cfg_now
+          if [[ "$cfg_now" == "y" || "$cfg_now" == "Y" ]]; then
+            runner_configure "$dir"
+          fi
+          echo ""
+          echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
+          continue
+        fi
         echo -e "${YELLOW}Запуск раннера...${NC}"
         if [ -n "$unit" ]; then
           # сервис установлен — запускаем через svc.sh
@@ -2671,6 +2784,12 @@ github_runner_control() {
         echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
         ;;
       3)
+        if ! runner_is_configured "$dir"; then
+          echo -e "${RED}Раннер не сконфигурирован — перезапускать нечего. Выполните пункт 7.${NC}"
+          echo ""
+          echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
+          continue
+        fi
         echo -e "${YELLOW}Перезапуск раннера...${NC}"
         if [ -f "$dir/svc.sh" ]; then
           runner_svc "$dir" stop && runner_svc "$dir" start
@@ -2739,6 +2858,21 @@ github_runner_control() {
         fi
         ;;
       7)
+        if runner_is_configured "$dir"; then
+          echo -e "${YELLOW}Раннер уже сконфигурирован. Переконфигурация перерегистрирует его в GitHub (--replace).${NC}"
+          echo -n -e "${GREEN}Продолжить? (y/n): ${NC}"
+          read -r cfg_again
+          if [[ "$cfg_again" != "y" && "$cfg_again" != "Y" ]]; then
+            echo -e "${YELLOW}Отменено.${NC}"
+            sleep 1
+            continue
+          fi
+        fi
+        runner_configure "$dir"
+        echo ""
+        echo -e "${YELLOW}Нажмите Enter, чтобы продолжить...${NC}"; read
+        ;;
+      8)
         return 0
         ;;
       *)
@@ -2784,6 +2918,7 @@ manage_github_runners() {
           status_text="${RED}неактивен${NC}"
         fi
       fi
+      runner_is_configured "$d" || status_text="${RED}не сконфигурирован${NC}"
       echo -e "${CYAN}$((i+1)).${NC} ${BOLD}$repo${NC} (${status_text})"
       echo -e "   ${YELLOW}Каталог:${NC} $d"
       echo -e "${YELLOW}---------------------------------------------${NC}"

@@ -463,14 +463,44 @@ rn2=$(call_fn runner_repo_name /home/u1/actions-runner-other)
 
 # control: start/stop/restart/status вызывают svc.sh
 : > "$SVC_LOG"
-printf '1\n\n2\n\n3\n\n4\n\n7\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; github_runner_control /root/actions-runner-myrepo" >/dev/null 2>&1
+printf '1\n\n2\n\n3\n\n4\n\n8\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; github_runner_control /root/actions-runner-myrepo" >/dev/null 2>&1
 grep -q 'svc start' "$SVC_LOG" && ok "control: запуск вызывает svc.sh start" || bad "control start" "$(cat "$SVC_LOG")"
 grep -q 'svc stop'  "$SVC_LOG" && ok "control: остановка вызывает svc.sh stop" || bad "control stop"
 grep -q 'svc status' "$SVC_LOG" && ok "control: статус вызывает svc.sh status" || bad "control status"
 
 # control: логи (опция 5) используют общий просмотрщик journalctl
-out=$(printf '5\n3\n7\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; github_runner_control /root/actions-runner-myrepo" 2>&1)
+out=$(printf '5\n3\n8\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; github_runner_control /root/actions-runner-myrepo" 2>&1)
 echo "$out" | grep -qi 'журнал' && ok "control: просмотр логов через view_service_logs" || bad "control logs" "$out"
+
+# control: несконфигурированный раннер (нет .runner) — запуск не идёт в run.sh,
+# а предлагает конфигурацию (это и была ошибка «Not configured» у пользователя)
+UNCFG=/root/actions-runner-uncfg; rm -rf "$UNCFG"; mkdir -p "$UNCFG"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$UNCFG/config.sh"; chmod +x "$UNCFG/config.sh"
+cat > "$UNCFG/run.sh" <<'RUNSH'
+#!/usr/bin/env bash
+echo "RUN_SH_CALLED" >> /tmp/uncfg_run.log
+exit 1
+RUNSH
+chmod +x "$UNCFG/run.sh"
+: > /tmp/uncfg_run.log
+out=$(printf '1\nn\n\n8\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; github_runner_control $UNCFG" 2>&1)
+echo "$out" | grep -qi 'НЕ сконфигурирован' && ok "control: показывает статус «не сконфигурирован»" || bad "control uncfg status" "$out"
+! grep -q RUN_SH_CALLED /tmp/uncfg_run.log && ok "control: не пытается запускать run.sh без конфигурации" || bad "control uncfg run.sh" "$(cat /tmp/uncfg_run.log)"
+
+# control: пункт 7 запускает config.sh с --unattended и токеном
+cat > "$UNCFG/config.sh" <<'CFGSH'
+#!/usr/bin/env bash
+echo "CONFIG_CALLED $*" >> /tmp/uncfg_cfg.log
+printf '{ "gitHubUrl": "https://github.com/owner/uncfg" }\n' > "$(dirname "$0")/.runner"
+exit 0
+CFGSH
+chmod +x "$UNCFG/config.sh"
+: > /tmp/uncfg_cfg.log
+printf '7\nowner/uncfg\nAAATOKEN\n\n\n8\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; github_runner_control $UNCFG" >/dev/null 2>&1
+grep -q 'CONFIG_CALLED .*--unattended' /tmp/uncfg_cfg.log && ok "control: конфигурация вызывает config.sh --unattended" || bad "control configure" "$(cat /tmp/uncfg_cfg.log)"
+grep -q 'CONFIG_CALLED .*--token AAATOKEN' /tmp/uncfg_cfg.log && ok "control: конфигурация передаёт токен" || bad "control configure token" "$(cat /tmp/uncfg_cfg.log)"
+grep -q 'CONFIG_CALLED .*--url https://github.com/owner/uncfg' /tmp/uncfg_cfg.log && ok "control: конфигурация передаёт url репозитория" || bad "control configure url" "$(cat /tmp/uncfg_cfg.log)"
+rm -rf "$UNCFG" /tmp/uncfg_run.log /tmp/uncfg_cfg.log
 
 # control: удаление (опция 6, подтверждение сервиса y, каталога y)
 printf '6\ny\ny\n' | bash -c "source /tmp/svc.sh >/dev/null 2>&1; github_runner_control /root/actions-runner-myrepo" >/dev/null 2>&1

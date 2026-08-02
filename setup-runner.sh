@@ -130,7 +130,7 @@ fi
 # для обычного пользователя безвредна. Сам сервис под systemd работает штатно.
 export RUNNER_ALLOW_RUNASROOT=1
 echo "==> конфигурирую раннер…"
-./config.sh \
+if ! ./config.sh \
   --unattended \
   --url "https://github.com/$REPO" \
   --token "$TOKEN" \
@@ -138,10 +138,26 @@ echo "==> конфигурирую раннер…"
   --labels "$LABELS" \
   --work "_work" \
   --replace
+then
+  echo "ERROR: config.sh не смог зарегистрировать раннер." >&2
+  echo "  Частые причины: токен просрочен (живёт ~1 час) или уже использован," >&2
+  echo "  нет доступа к github.com, либо указан не тот репозиторий ($REPO)." >&2
+  echo "  Возьми новый токен: Settings → Actions → Runners → New self-hosted runner" >&2
+  echo "  Бинарники уже распакованы в $RUNNER_DIR — повторный запуск скачивать заново не будет." >&2
+  exit 1
+fi
+
+# .runner создаётся только при успешной регистрации; без него run.sh падает
+# с «Not configured», а svc.sh вообще не появляется.
+[[ -f "$RUNNER_DIR/.runner" ]] || die "конфигурация не завершена: файл .runner не создан в $RUNNER_DIR"
 
 # ---- run as a service (или fallback) ----
 RUN_USER="$(whoami)"
-if command -v sudo >/dev/null 2>&1; then
+if [[ ! -f "./svc.sh" ]]; then
+  echo "⚠ svc.sh не создан config.sh — сервис поставить нельзя."
+  echo "  Запусти раннер вручную (в фоне):  cd '$RUNNER_DIR' && RUNNER_ALLOW_RUNASROOT=1 nohup ./run.sh </dev/null >runner.log 2>&1 &"
+  SERVICE_MODE="manual"
+elif command -v sudo >/dev/null 2>&1; then
   echo "==> устанавливаю сервис ($OS) от пользователя '$RUN_USER'…"
   sudo ./svc.sh install "$RUN_USER"
   sudo ./svc.sh start
