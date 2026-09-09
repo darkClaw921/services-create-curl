@@ -122,6 +122,53 @@ clear_screen() {
 }
 
 # Безопасная функция перезагрузки/запуска nginx
+# Начиная с nginx 1.25.1 директива `listen ... http2` объявлена устаревшей,
+# ей на смену пришла отдельная `http2 on;`. На более старых сборках `http2 on;`
+# наоборот приводит к ошибке запуска, поэтому синтаксис выбирается по версии.
+nginx_supports_http2_on() {
+  local v
+  v=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+  [ -z "$v" ] && return 1
+  local maj min pat
+  maj=$(echo "$v" | cut -d. -f1)
+  min=$(echo "$v" | cut -d. -f2)
+  pat=$(echo "$v" | cut -d. -f3)
+  [ "$maj" -gt 1 ] && return 0
+  [ "$maj" -lt 1 ] && return 1
+  [ "$min" -gt 25 ] && return 0
+  [ "$min" -lt 25 ] && return 1
+  [ "$pat" -ge 1 ] && return 0
+  return 1
+}
+
+# Блок listen для HTTPS с включённым HTTP/2. HTTP/2 важен именно для мобильных:
+# по HTTP/1.1 браузер держит не более 6 параллельных соединений, и на сети с
+# высокой задержкой страница со множеством файлов грузится ощутимо дольше.
+nginx_ssl_listen_block() {
+  if nginx_supports_http2_on; then
+    printf '    listen 443 ssl;\n    listen [::]:443 ssl;\n    http2 on;'
+  else
+    printf '    listen 443 ssl http2;\n    listen [::]:443 ssl http2;'
+  fi
+}
+
+# Сжатие ответов. На мобильных сетях экономия трафика напрямую превращается
+# в скорость открытия страницы.
+nginx_gzip_block() {
+  cat <<'GZIPEOF'
+    # Сжатие — заметно ускоряет открытие с мобильных сетей
+    gzip on;
+    gzip_vary on;
+    gzip_comp_level 6;
+    gzip_min_length 1024;
+    gzip_proxied any;
+    gzip_types text/plain text/css text/xml text/javascript
+               application/javascript application/json application/xml
+               application/rss+xml image/svg+xml font/ttf font/otf
+               application/font-woff application/font-woff2;
+GZIPEOF
+}
+
 safe_nginx_reload() {
   # Проверяем, запущен ли nginx
   if systemctl is-active --quiet nginx; then
@@ -1240,7 +1287,14 @@ issue_wildcard_certificate() {
   read
   
   # Запускаем certbot с DNS challenge (интерактивный режим обязателен для DNS challenge)
-  local certbot_cmd="certbot certonly --manual --preferred-challenges dns"
+  #
+  # --key-type rsa обязателен. Начиная с certbot 2.0 по умолчанию выпускается
+  # ECDSA-сертификат, а его цепочка замыкается на корни ISRG Root X2 / Root YE,
+  # которых нет в хранилищах доверия большинства Android (X2 появился только в
+  # Android 14) и старых iOS. На десктопе такой сайт открывается (Chrome и
+  # Firefox носят собственное хранилище корней), а с телефонов — нет.
+  # RSA-цепочка идёт на ISRG Root X1: Android 7.1.1+ и все актуальные iOS.
+  local certbot_cmd="certbot certonly --manual --preferred-challenges dns --key-type rsa --rsa-key-size 2048"
   
   if [ "$certbot_registered" = false ]; then
     # Для нового аккаунта добавляем email и согласие с условиями
@@ -1329,6 +1383,11 @@ issue_wildcard_certificate() {
       has_ssl_cache=true
     fi
     
+    # Синтаксис HTTP/2 зависит от версии nginx, а gzip ускоряет мобильных клиентов
+    local ssl_listen_block gzip_block
+    ssl_listen_block="$(nginx_ssl_listen_block)"
+    gzip_block="$(nginx_gzip_block)"
+
     # Создаем новую конфигурацию с SSL
     cat > "$temp_config" << EOF
 server {
@@ -1341,13 +1400,13 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+${ssl_listen_block}
     server_name *.${base_domain} ${base_domain};
     
     ssl_certificate ${cert_path};
     ssl_certificate_key ${key_path};
     
+${gzip_block}
     # SSL настройки
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_prefer_server_ciphers on;
@@ -1570,10 +1629,12 @@ issue_ssl_certificate() {
     echo ""
     
     # Запускаем certbot с параметрами (обычный HTTP challenge)
+    # --key-type rsa — чтобы сайт открывался с телефонов, см. комментарий
+    # в issue_wildcard_certificate.
     if [ "$certbot_registered" = false ]; then
-      certbot --nginx -d "$base_domain" --non-interactive --agree-tos --redirect $email_param
+      certbot --nginx -d "$base_domain" --key-type rsa --rsa-key-size 2048 --non-interactive --agree-tos --redirect $email_param
     else
-      certbot --nginx -d "$base_domain"
+      certbot --nginx -d "$base_domain" --key-type rsa --rsa-key-size 2048
     fi
     
     if [ $? -eq 0 ]; then
@@ -2126,6 +2187,10 @@ PHPEOF
   echo ""
   echo -e "${YELLOW}Создание конфигурационного файла...${NC}"
 
+  # Сжатие ответов — ускоряет открытие сайта с мобильных сетей
+  local gzip_block
+  gzip_block="$(nginx_gzip_block)"
+
   # Формируем блок location с учетом типа конфигурации
   if [ "$is_php_mode" = true ]; then
     # Проверяем наличие snippets/fastcgi-php.conf
@@ -2151,6 +2216,7 @@ server {
     listen [::]:80;
     server_name ${server_name_line};
 
+${gzip_block}
     root ${php_root};
     index index.php index.html index.htm;
 
@@ -2178,6 +2244,7 @@ server {
     listen [::]:80;
     server_name ${server_name_line};
 
+${gzip_block}
     location / {
         proxy_pass ${proxy_target};
         proxy_http_version 1.1;
@@ -2198,6 +2265,7 @@ server {
     listen [::]:80;
     server_name ${server_name_line};
 
+${gzip_block}
     location / {
         proxy_pass ${proxy_target};
         proxy_set_header Host \$host;
