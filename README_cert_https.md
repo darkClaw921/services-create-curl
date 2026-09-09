@@ -77,8 +77,18 @@ sudo apt install certbot python3-certbot-nginx
 
 2. Получите SSL-сертификат для домена:
 ```
-sudo certbot --nginx -d orc-document.alteran-industries.ru
+sudo certbot --nginx --key-type rsa --rsa-key-size 2048 -d orc-document.alteran-industries.ru
 ```
+
+> **`--key-type rsa` обязателен, иначе сайт не откроется с телефонов.**
+> Начиная с certbot 2.0 по умолчанию выпускается ECDSA-сертификат, а его
+> цепочка замыкается на корни `ISRG Root X2` / `Root YE`. Этих корней нет в
+> системных хранилищах доверия большинства Android (X2 появился только в
+> Android 14) и старых iOS. На десктопе такой сайт открывается — Chrome и
+> Firefox носят собственное хранилище корней и обновляют его сами, — а с
+> телефона показывает «сертификат не является доверенным».
+> RSA-цепочка идёт на `ISRG Root X1`, который есть в Android с 7.1.1 и во всех
+> актуальных iOS. `service.sh` подставляет этот флаг сам.
 
 Certbot автоматически:
 - Получит сертификат от Let's Encrypt
@@ -110,6 +120,48 @@ https://orc-document.alteran-industries.ru
 sudo certbot renew --dry-run
 ```
 
+## 5.1. Если сертификат уже выпущен как ECDSA
+
+Проверить, какой ключ у действующего сертификата:
+```
+sudo openssl x509 -in /etc/letsencrypt/live/ВАШ_ДОМЕН/cert.pem -noout -text | grep "Public Key Algorithm"
+```
+`id-ecPublicKey` означает ECDSA — с телефонов такой сайт открываться не будет.
+
+Посмотреть, на какой корень замыкается цепочка:
+```
+echo | openssl s_client -connect ВАШ_ДОМЕН:443 -servername ВАШ_ДОМЕН 2>/dev/null | grep " s:"
+```
+
+Проверить глазами старого телефона — клиентом без поддержки ECDSA:
+```
+echo | openssl s_client -connect ВАШ_ДОМЕН:443 -servername ВАШ_ДОМЕН \
+  -sigalgs "RSA-PSS+SHA256:RSA+SHA256" 2>/dev/null | grep " s:"
+```
+Если команда не вернула цепочку — телефоны на этот сайт зайти не могут.
+
+Перевыпустить в RSA:
+```
+sudo certbot certonly --nginx --cert-name ВАШ_ДОМЕН \
+  --key-type rsa --rsa-key-size 2048 --force-renewal -d ВАШ_ДОМЕН
+sudo systemctl reload nginx
+```
+
+Можно держать **обе** пары сразу: современные устройства получат быстрый ECDSA,
+старые телефоны — RSA. Для этого выпустите RSA отдельным именем и пропишите обе
+пары в конфиг. Порядок важен: nginx сопоставляет сертификаты и ключи по порядку
+следования, поэтому каждая пара должна идти подряд.
+```
+sudo certbot certonly --nginx --cert-name ВАШ_ДОМЕН-rsa \
+  --key-type rsa --rsa-key-size 2048 -d ВАШ_ДОМЕН
+```
+```
+ssl_certificate     /etc/letsencrypt/live/ВАШ_ДОМЕН/fullchain.pem;
+ssl_certificate_key /etc/letsencrypt/live/ВАШ_ДОМЕН/privkey.pem;
+ssl_certificate     /etc/letsencrypt/live/ВАШ_ДОМЕН-rsa/fullchain.pem;
+ssl_certificate_key /etc/letsencrypt/live/ВАШ_ДОМЕН-rsa/privkey.pem;
+```
+
 ## 6. Дополнительные настройки (опционально)
 
 Для улучшения безопасности добавьте следующие параметры в блок server для HTTPS:
@@ -119,6 +171,28 @@ ssl_prefer_server_ciphers on;
 ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384';
 ssl_session_cache shared:SSL:10m;
 ssl_session_timeout 10m;
+```
+
+Скорость открытия с мобильных сетей сильнее всего поднимают ещё две вещи —
+`service.sh` добавляет их в генерируемые конфигурации сам:
+
+```
+# HTTP/2. По HTTP/1.1 браузер держит не более 6 параллельных соединений,
+# и на сети с высокой задержкой страница со множеством файлов грузится долго.
+# Синтаксис зависит от версии nginx:
+#   nginx >= 1.25.1:  listen 443 ssl;  + отдельная строка  http2 on;
+#   nginx <  1.25.1:  listen 443 ssl http2;
+http2 on;
+
+# Сжатие
+gzip on;
+gzip_vary on;
+gzip_comp_level 6;
+gzip_min_length 1024;
+gzip_proxied any;
+gzip_types text/plain text/css text/xml text/javascript
+           application/javascript application/json application/xml
+           application/rss+xml image/svg+xml font/ttf font/otf;
 ```
 
 ## 7. Проверка фаерволла

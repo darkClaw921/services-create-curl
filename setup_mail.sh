@@ -2725,7 +2725,12 @@ fix_tls_certificate() {
     echo ""
 
     local certbot_output
-    certbot_output=$(certbot certonly $certbot_method -d "$hostname_fqdn" --non-interactive --agree-tos --register-unsafely-without-email 2>&1)
+    # --key-type rsa: с certbot 2.0 по умолчанию выпускается ECDSA-сертификат,
+    # цепочка которого замыкается на корни ISRG Root X2 / Root YE. Их нет в
+    # хранилищах доверия большинства Android и старых iOS, поэтому почтовые
+    # клиенты на телефонах отказываются подключаться к IMAP/SMTP по TLS.
+    # RSA-цепочка идёт на ISRG Root X1 и принимается везде.
+    certbot_output=$(certbot certonly $certbot_method -d "$hostname_fqdn" --key-type rsa --rsa-key-size 2048 --non-interactive --agree-tos --register-unsafely-without-email 2>&1)
     local certbot_exit=$?
 
     # Возвращаем веб-сервер если останавливали
@@ -2745,7 +2750,7 @@ fix_tls_certificate() {
       echo -e "${CYAN}•${NC} Превышен лимит запросов Let's Encrypt"
       echo ""
       echo -e "${YELLOW}Попробуйте вручную:${NC}"
-      echo -e "${CYAN}systemctl stop nginx 2>/dev/null; certbot certonly --standalone -d ${hostname_fqdn}${NC}"
+      echo -e "${CYAN}systemctl stop nginx 2>/dev/null; certbot certonly --standalone --key-type rsa --rsa-key-size 2048 -d ${hostname_fqdn}${NC}"
       set -e
       return 1
     fi
